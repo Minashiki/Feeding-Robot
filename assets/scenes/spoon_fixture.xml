@@ -1,0 +1,33 @@
+<mujoco model="spoon fixture">
+  <compiler angle="radian"/>
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="50"/>
+  <default>
+    <default class="tool">
+      <geom contype="1" conaffinity="1" group="3" friction="0.5 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.001" condim="3"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="fixture_base" pos="0 0 0.2">
+      <body name="tool_mount" gravcomp="0">
+        <site name="ft_site" pos="0 0 0" size="0.008" rgba="1 0.2 0.2 1"/>
+        <geom name="tool_mount_geom" type="cylinder" size="0.016 0.008" pos="0 0 0.008" mass="0.03" class="tool" rgba="0.35 0.35 0.38 1"/>
+        <geom name="tool_handle" type="box" size="0.05 0.004 0.003" pos="0.062 0 0.012" mass="0.02" class="tool" rgba="0.55 0.55 0.58 1"/>
+        <geom name="bowl_bottom" type="box" size="0.0245 0.017 0.001" pos="0.1345 0 0.015" mass="0.012" class="tool" rgba="0.75 0.75 0.8 1"/>
+        <geom name="bowl_back" type="box" size="0.0015 0.017 0.0045" pos="0.1105 0 0.0195" mass="0.005" class="tool" rgba="0.7 0.7 0.75 1"/>
+        <geom name="bowl_left" type="box" size="0.023 0.001 0.0045" pos="0.1345 0.016 0.0195" mass="0.005" class="tool" rgba="0.7 0.7 0.75 1"/>
+        <geom name="bowl_right" type="box" size="0.023 0.001 0.0045" pos="0.1345 -0.016 0.0195" mass="0.005" class="tool" rgba="0.7 0.7 0.75 1"/>
+        <geom name="bowl_front" type="box" size="0.0015 0.017 0.0015" pos="0.1585 0 0.0165" mass="0.003" class="tool" rgba="0.65 0.65 0.7 1"/>
+        <site name="tcp" pos="0.1345 0 0.016" size="0.006" rgba="0.1 0.9 0.2 1"/>
+      </body>
+    </body>
+    <body name="food" pos="0.1345 0 0.23">
+      <freejoint name="food_joint"/>
+      <inertial mass="0.003" pos="0 0 0" diaginertia="7.2e-8 7.2e-8 7.2e-8"/>
+      <geom name="food_box" type="box" size="0.006 0.006 0.006" mass="0.003" friction="0.5 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.001" condim="3" rgba="0.85 0.45 0.15 1"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <force name="ft_force" site="ft_site"/>
+    <torque name="ft_torque" site="ft_site"/>
+  </sensor>
+</mujoco>

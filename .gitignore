@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+outputs/
+.mujoco/
+机械臂复杂控制文献调研.md
+IdealModelPlan.md
+M1Plan.md

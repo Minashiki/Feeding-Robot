@@ -1,0 +1,43 @@
+{
+  "model": "assets/scenes/feeding_p0.xml",
+  "fixture": "assets/scenes/spoon_fixture.xml",
+  "sphere_model": "assets/scenes/feeding_p0_sphere.xml",
+  "wrench_sign": -1.0,
+  "wrench_sign_meaning": "MuJoCo force/torque sensors report parent-on-child load in the site frame. s=-1 maps that reading to the external wrench applied on the tool. The moment of wrench_world is at ft_site; tcp_wrench_world moves it to tcp.",
+  "tool_mass_kg": 0.08,
+  "food_mass_kg": 0.003,
+  "velocity_soft_limit_rad_s": 0.5,
+  "settle_steps": 400,
+  "head": {
+    "amp_m": 0.01,
+    "freq_hz": 0.2,
+    "yaw_amp_rad": 0.08726646259971647,
+    "jaw_center_rad": 0.1,
+    "jaw_amp_rad": 0.08,
+    "kp": [800, 800, 1200, 8, 2.0],
+    "kd": [60, 60, 80, 1.0, 0.15]
+  },
+  "q_carry": [-0.50725, 0.28771, 0.2699, -2.68687, -0.4071, 2.94933, 1.2911],
+  "q_tilt": [-1.47897, 0.15252, 1.00836, -2.27191, 0.57578, 1.33518, 0.54926],
+  "q_mouth_out": [-0.07453, -0.48742, 0.45007, -2.79308, 0.28397, 2.32734, 0.13121],
+  "q_mouth_lip": [-0.17538, -0.27319, 0.46251, -2.56732, 0.16437, 2.31487, 0.16034],
+  "q_mouth_in": [-0.19669, -0.19757, 0.4751, -2.53822, 0.12755, 2.35798, 0.17986],
+  "q_torque_poses": [
+    [0.0, 0.3, 0.0, -1.5, 0.0, 2.0, 0.6],
+    [0.5, -0.3, 0.4, -2.0, 0.4, 2.4, -0.3],
+    [-0.4, 0.6, -0.2, -1.3, -0.5, 1.8, 0.9]
+  ],
+  "presets": {
+    "food_on_plate": {
+      "qpos": [-0.50725, 0.28771, 0.2699, -2.68687, -0.4071, 2.94933, 1.2911]
+    },
+    "food_on_spoon": {
+      "qpos": [-0.50725, 0.28771, 0.2699, -2.68687, -0.4071, 2.94933, 1.2911]
+    },
+    "near_mouth": {
+      "qpos": [-0.07453, -0.48742, 0.45007, -2.79308, 0.28397, 2.32734, 0.13121]
+    }
+  },
+  "replay_seed": 7,
+  "fixed_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
+}
