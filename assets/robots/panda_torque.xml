@@ -18,7 +18,7 @@
 
   <default>
     <default class="tool">
-      <geom contype="1" conaffinity="1" group="3" friction="0.5 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.001" condim="3" density="0"/>
+      <geom contype="1" conaffinity="1" group="3" friction="0.5 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001" condim="3" density="0"/>
     </default>
     <default class="arm_motor">
       <motor ctrllimited="true" forcelimited="true" gear="1"/>
@@ -190,13 +190,13 @@
                     <geom mesh="link7_c" class="panda/collision"/>
                     <body name="tool_mount" pos="0 0 0.107" quat="0 1 0 0" gravcomp="0">
                       <site name="ft_site" pos="0 0 0" size="0.008" rgba="1 0.2 0.2 1"/>
-                      <geom name="tool_mount_geom" type="cylinder" size="0.016 0.008" pos="0 0 0.008" mass="0.03" rgba="0.35 0.35 0.38 1" class="tool"/>
-                      <geom name="tool_handle" type="box" size="0.05 0.004 0.003" pos="0.062 0 0.012" mass="0.02" rgba="0.55 0.55 0.58 1" class="tool"/>
-                      <geom name="bowl_bottom" type="box" size="0.0245 0.017 0.001" pos="0.1345 0 0.015" mass="0.012" rgba="0.75 0.75 0.8 1" class="tool"/>
-                      <geom name="bowl_back" type="box" size="0.0015 0.017 0.0045" pos="0.1105 0 0.0195" mass="0.005" rgba="0.7 0.7 0.75 1" class="tool"/>
-                      <geom name="bowl_left" type="box" size="0.023 0.001 0.0045" pos="0.1345 0.016 0.0195" mass="0.005" rgba="0.7 0.7 0.75 1" class="tool"/>
-                      <geom name="bowl_right" type="box" size="0.023 0.001 0.0045" pos="0.1345 -0.016 0.0195" mass="0.005" rgba="0.7 0.7 0.75 1" class="tool"/>
-                      <geom name="bowl_front" type="box" size="0.0015 0.017 0.0015" pos="0.1585 0 0.0165" mass="0.003" rgba="0.65 0.65 0.7 1" class="tool"/>
+                      <geom name="tool_mount_geom" type="cylinder" size="0.016 0.008" pos="0 0 0.008" mass="0.03" rgba="0.35 0.35 0.38 1" class="tool" friction="0.15 0.005 0.0001"/>
+                      <geom name="tool_handle" type="box" size="0.05 0.004 0.003" pos="0.062 0 0.012" mass="0.02" rgba="0.55 0.55 0.58 1" class="tool" friction="0.15 0.005 0.0001"/>
+                      <geom name="bowl_bottom" type="box" size="0.0245 0.017 0.001" pos="0.1345 0 0.015" mass="0.012" rgba="0.75 0.75 0.8 1" class="tool" friction="0.15 0.005 0.0001"/>
+                      <geom name="bowl_back" type="box" size="0.0015 0.017 0.0045" pos="0.1105 0 0.0195" mass="0.005" rgba="0.7 0.7 0.75 1" class="tool" friction="0.15 0.005 0.0001"/>
+                      <geom name="bowl_left" type="box" size="0.023 0.001 0.0045" pos="0.1345 0.016 0.0195" mass="0.005" rgba="0.7 0.7 0.75 1" class="tool" friction="0.15 0.005 0.0001"/>
+                      <geom name="bowl_right" type="box" size="0.023 0.001 0.0045" pos="0.1345 -0.016 0.0195" mass="0.005" rgba="0.7 0.7 0.75 1" class="tool" friction="0.15 0.005 0.0001"/>
+                      <geom name="bowl_front" type="box" size="0.0015 0.017 0.001" pos="0.1585 0 0.015" mass="0.003" rgba="0.65 0.65 0.7 1" class="tool" friction="0.15 0.005 0.0001"/>
                       <site name="tcp" pos="0.1345 0 0.016" size="0.006" rgba="0.1 0.9 0.2 1"/>
                     </body>
                   </body>

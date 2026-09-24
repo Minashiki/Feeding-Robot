@@ -2,13 +2,14 @@
 
 import numpy as np
 
+from feedingrobot.sim.cases import save_case
 from feedingrobot.sim.model import ModelIndex, load_model, repo_root
 from feedingrobot.sim.scene import FeedingScene
 from feedingrobot.sim.sensors import shift_torque
 
 
-def test_t01_names_and_motors():
-    scene = FeedingScene(str(repo_root() / "configs" / "m1_scene.json"))
+def test_t01_names_and_motors(m1_config):
+    scene = FeedingScene(m1_config)
     model = scene.model
     assert model.nu == 12
     for name in ["ft_site", "tcp", "plate_frame", "mouth_entry", "mouth_receiver", "ft_force", "ft_torque"]:
@@ -17,13 +18,14 @@ def test_t01_names_and_motors():
     # free joint is not packed into the arm slice
     assert int(scene.index.food_qpos_adr) == 7
     assert int(scene.index.arm_qpos_adr[0]) == 0
+    save_case("T01", {"nu": int(model.nu), "tool_mass": float(model.body_mass[scene.index.tool_body_id])})
     assert model.body_mass[scene.index.tool_body_id] == np.float64(scene.config["tool_mass_kg"]) or abs(
         model.body_mass[scene.index.tool_body_id] - scene.config["tool_mass_kg"]
     ) < 1e-9
 
 
-def test_t05_frame_roundtrip_and_mass():
-    scene = FeedingScene(str(repo_root() / "configs" / "m1_scene.json"))
+def test_t05_frame_roundtrip_and_mass(m1_config):
+    scene = FeedingScene(m1_config)
     scene.reset(seed=1, preset="food_on_plate")
     state = scene.snapshot()
     rot = state["ft_mat"]
@@ -45,6 +47,7 @@ def test_t05_frame_roundtrip_and_mass():
         if scene.model.geom_contype[gid] == 0 and scene.model.geom_bodyid[gid] == scene.index.tool_body_id:
             visual += 1
     assert visual == 0
+    save_case("T05", {"roundtrip_m": float(np.linalg.norm(back - vector)), "tool_mass": 0.08})
 
 
 def test_sphere_food_settles_on_plate():

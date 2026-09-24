@@ -3,6 +3,7 @@
 import mujoco
 import numpy as np
 
+from feedingrobot.sim.cases import save_case
 from feedingrobot.sim.model import repo_root
 from feedingrobot.sim.scene import FeedingScene
 from feedingrobot.sim.sensors import read_raw_wrench, site_position, site_rotation, world_and_tcp_wrench
@@ -62,8 +63,8 @@ def test_t06_fixture_and_rotated_tool():
     _check_delta(model, data, body, sign, point)
 
 
-def test_t06_full_panda_static():
-    scene = FeedingScene(str(repo_root() / "configs" / "m1_scene.json"))
+def test_t06_full_panda_static(m1_config):
+    scene = FeedingScene(m1_config)
     q = np.array(scene.config["q_torque_poses"][2], dtype=float)
     scene.data.qpos[scene.index.arm_qpos_adr] = q
     scene.data.qvel[:] = 0
@@ -99,3 +100,4 @@ def test_t06_full_panda_static():
         r = point - site
         expect_t = np.cross(r, force)
         assert np.max(np.abs(delta[3:] - expect_t)) <= max(0.002, 0.02 * max(np.max(np.abs(expect_t)), 1e-9))
+    save_case("T06", {"max_force_error_n": float(np.max(np.abs(delta[:3] - force)))})

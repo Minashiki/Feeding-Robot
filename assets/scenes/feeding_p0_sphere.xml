@@ -1,11 +1,11 @@
 <mujoco model="feeding p0">
   <include file="../robots/panda_torque.xml"/>
 
-  <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="50" impratio="10"/>
+  <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="50" cone="elliptic" impratio="10"/>
 
   <default>
     <default class="task">
-      <geom friction="0.5 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.001" condim="3" group="3"/>
+      <geom friction="0.5 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001" condim="3" group="3"/>
     </default>
     <default class="scene_motor">
       <motor ctrllimited="true" forcelimited="true" gear="1"/>

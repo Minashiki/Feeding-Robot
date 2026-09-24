@@ -39,6 +39,7 @@ class FeedingScene:
             "tolerance": float(self.model.opt.tolerance),
         }
         self.applied_wrench = None
+        self._experiment = None
         self._clear_python_state()
 
     def restore_model_options(self) -> None:
@@ -55,8 +56,15 @@ class FeedingScene:
         self.peak_contact_force = 0.0
         self.last_tau = np.zeros(7)
         self.velocity_fault = False
+        self.speed_limit = float(self.config["velocity_soft_limit_rad_s"])
         self.applied_wrench = None
         self.settle_steps = 0
+        self._hold_latched = False
+        self._hold_head_target = None
+        self._hold_latch_time = None
+        self._head_saturated_steps = 0
+        self._last_head_des = np.zeros(5)
+        self._last_head_err = np.zeros(5)
 
     def set_external_wrench(self, force, torque, point, body_name: str = "tool_mount") -> None:
         """Wrench applied on the next steps. Torque is about `point` in world."""
@@ -85,13 +93,21 @@ class FeedingScene:
         self.data.xfrc_applied[body, :3] = force
         self.data.xfrc_applied[body, 3:] = torque_com
 
-    def _head_targets(self, t: float, hold: bool):
-        cfg = self.config["head"]
+    def _current_head(self) -> np.ndarray:
         q = np.zeros(5)
         q[:4] = self.data.qpos[self.index.head_qpos_adr]
         q[4] = self.data.qpos[self.index.jaw_qpos_adr]
+        return q
+
+    def _head_targets(self, t: float, hold: bool):
+        cfg = self.config["head"]
         if hold:
-            return q, np.zeros(5)
+            if not self._hold_latched:
+                self._hold_head_target = self._current_head().copy()
+                self._hold_latched = True
+                self._hold_latch_time = float(self.data.time)
+            return self._hold_head_target.copy(), np.zeros(5)
+        self._hold_latched = False
         w = 2.0 * np.pi * float(cfg["freq_hz"])
         amp = float(cfg["amp_m"])
         yaw = float(cfg["yaw_amp_rad"])
@@ -100,7 +116,7 @@ class FeedingScene:
         des = np.array(
             [
                 amp * np.sin(w * t),
-                amp * np.sin(w * t + 1.2),
+                amp * np.sin(w * t),
                 0.0,
                 yaw * np.sin(w * t),
                 jaw0 + jaw * np.sin(w * t),
@@ -109,7 +125,7 @@ class FeedingScene:
         vel = np.array(
             [
                 amp * w * np.cos(w * t),
-                amp * w * np.cos(w * t + 1.2),
+                amp * w * np.cos(w * t),
                 0.0,
                 yaw * w * np.cos(w * t),
                 jaw * w * np.cos(w * t),
@@ -140,18 +156,51 @@ class FeedingScene:
         self.data.ctrl[ids] = cmd
         self._head_gravcomp = bias.copy()
         self._head_tau = cmd.copy()
+        self._last_head_des = des.copy()
+        self._last_head_err = des - q
+        if np.any(np.abs(cmd - lo) < 1e-8) or np.any(np.abs(cmd - hi) < 1e-8):
+            self._head_saturated_steps += 1
         return cmd
 
     def bias_tau(self) -> np.ndarray:
         mujoco.mj_forward(self.model, self.data)
         return np.array(self.data.qfrc_bias[self.index.arm_dof_adr], dtype=float).copy()
 
-    def diagnostic_pd_tau(self, q_des, kp: float = 40.0, kd: float = 8.0) -> np.ndarray:
+    def diagnostic_pd_tau(self, q_des, kp: float = 40.0, kd: float = 8.0, dq_des=None) -> np.ndarray:
         """Explicit joint PD plus bias. Test fixture only; not the M2 controller."""
         q = np.array(self.data.qpos[self.index.arm_qpos_adr], dtype=float)
         dq = np.array(self.data.qvel[self.index.arm_dof_adr], dtype=float)
-        tau = self.bias_tau() + kp * (np.asarray(q_des, dtype=float) - q) - kd * dq
+        if dq_des is None:
+            dq_des = np.zeros(7)
+        tau = self.bias_tau() + kp * (np.asarray(q_des, dtype=float) - q) + kd * (np.asarray(dq_des, dtype=float) - dq)
         return tau
+
+    def apply_experiment(self, timestep=None, iterations=None, tolerance=None, speed_limit=None) -> None:
+        """Set the solver or speed limit after reset. reset() restores the baseline."""
+        self._experiment = {
+            "timestep": None if timestep is None else float(timestep),
+            "iterations": None if iterations is None else int(iterations),
+            "tolerance": None if tolerance is None else float(tolerance),
+            "speed_limit": None if speed_limit is None else float(speed_limit),
+        }
+        if timestep is not None:
+            self.model.opt.timestep = float(timestep)
+            self.dt = float(timestep)
+        if iterations is not None:
+            self.model.opt.iterations = int(iterations)
+        if tolerance is not None:
+            self.model.opt.tolerance = float(tolerance)
+        if speed_limit is not None:
+            self.speed_limit = float(speed_limit)
+
+    def effective_options(self) -> dict:
+        return {
+            "timestep": float(self.model.opt.timestep),
+            "iterations": int(self.model.opt.iterations),
+            "tolerance": float(self.model.opt.tolerance),
+            "speed_limit": float(self.speed_limit),
+            "gravity": np.array(self.model.opt.gravity, dtype=float).tolist(),
+        }
 
     def step_physics(self, tau_arm, hold_driver: bool = False) -> dict:
         tau = _as_vec(tau_arm, 7)
@@ -169,8 +218,7 @@ class FeedingScene:
         self.tick += 1
         self.last_tau = cmd.copy()
         dq = np.array(self.data.qvel[self.index.arm_dof_adr], dtype=float)
-        limit = float(self.config["velocity_soft_limit_rad_s"])
-        if np.any(np.abs(dq) > limit):
+        if np.any(np.abs(dq) > self.speed_limit):
             self.velocity_fault = True
         state = self.snapshot()
         state["tau_requested"] = tau.copy()
@@ -226,7 +274,21 @@ class FeedingScene:
             "qfrc_actuator": np.array(self.data.qfrc_actuator[idx.arm_dof_adr], dtype=float).copy(),
             "actuator_force": np.array(self.data.actuator_force[idx.arm_actuator_ids], dtype=float).copy(),
             "velocity_fault": bool(self.velocity_fault),
-            "finite": bool(np.all(np.isfinite(self.data.qpos)) and np.all(np.isfinite(self.data.qvel))),
+            "speed_limit": float(self.speed_limit),
+            "finite": bool(
+                np.all(np.isfinite(self.data.qpos))
+                and np.all(np.isfinite(self.data.qvel))
+                and np.all(np.isfinite(self.data.qacc))
+            ),
+            "head_target": self._last_head_des.copy(),
+            "head_error": self._last_head_err.copy(),
+            "hold_latched": bool(self._hold_latched),
+            "hold_target": None if self._hold_head_target is None else self._hold_head_target.copy(),
+            "hold_latch_time": self._hold_latch_time,
+            "head_saturated_steps": int(self._head_saturated_steps),
+            "mouth_pos": site_position(self.data, idx.site_ids["mouth_entry"]),
+            "mouth_mat": site_rotation(self.data, idx.site_ids["mouth_entry"]),
+            "qacc_arm": np.array(self.data.qacc[idx.arm_dof_adr], dtype=float).copy(),
         }
 
     def _set_arm(self, q) -> None:
@@ -263,10 +325,11 @@ class FeedingScene:
                 return True
         return False
 
-    def reset(self, seed: int | None = None, preset: str = "food_on_plate") -> dict:
+    def reset(self, seed: int | None = None, preset: str = "food_on_plate", settle_steps: int | None = None) -> dict:
         if seed is not None:
             self.rng = np.random.default_rng(int(seed))
         self.restore_model_options()
+        self._experiment = None
         mujoco.mj_resetData(self.model, self.data)
         self._clear_python_state()
         spec = self.config["presets"][preset]
@@ -285,13 +348,19 @@ class FeedingScene:
                 break
         if not placed:
             raise RuntimeError(f"reset failed for preset {preset}, last food pos {last_pos}")
-        settle = int(self.config["settle_steps"])
+        settle = int(self.config["settle_steps"] if settle_steps is None else settle_steps)
         for _ in range(settle):
             self.step_physics(self.bias_tau(), hold_driver=True)
+        if self._illegal():
+            raise RuntimeError(f"settled state is illegal for preset {preset}")
         self.settle_steps = settle
         self.contact_events.clear()
         self.peak_contact_force = 0.0
         self.velocity_fault = False
+        self._head_saturated_steps = 0
+        self._hold_latched = False
+        self._hold_head_target = None
+        self._hold_latch_time = None
         self.tick = 0
         self.time_offset = float(self.data.time)
         self.data.ctrl[:] = 0

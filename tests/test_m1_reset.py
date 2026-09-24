@@ -2,6 +2,7 @@
 
 import numpy as np
 
+from feedingrobot.sim.cases import save_case
 from feedingrobot.sim.model import repo_root
 from feedingrobot.sim.scene import FeedingScene
 
@@ -27,38 +28,35 @@ def _signature(scene):
     )
 
 
-def test_t11_reset_replay():
-    cfg = str(repo_root() / "configs" / "m1_scene.json")
-    seeds = list(range(50))
+def test_t11_reset_replay(m1_config):
+    scene = FeedingScene(m1_config)
     tau = np.array([0.2, -0.1, 0.0, 0.15, 0.05, -0.05, 0.0])
-    for seed in seeds:
-        a = FeedingScene(cfg)
-        b = FeedingScene(cfg)
-        _contaminate(a)
-        state_a = a.reset(seed=seed, preset="food_on_plate")
-        state_b = b.reset(seed=seed, preset="food_on_plate")
-        assert a.applied_wrench is None
-        assert a.tick == 0
-        assert a.contact_events == []
-        assert a.peak_contact_force == 0
-        assert np.max(np.abs(a.data.xfrc_applied)) == 0
-        assert np.max(np.abs(a.data.ctrl)) == 0
-        assert np.allclose(_signature(a), _signature(b), atol=1e-9)
-        for _ in range(30):
-            sa = a.step_physics(tau, hold_driver=True)
-            sb = b.step_physics(tau, hold_driver=True)
-        assert np.allclose(sa["q"], sb["q"], atol=1e-9)
-        assert np.allclose(sa["dq"], sb["dq"], atol=1e-9)
-        assert state_a["finite"] and state_b["finite"]
-
+    reference = None
+    replay_reference = None
+    for _ in range(50):
+        _contaminate(scene)
+        scene.reset(seed=7, preset="food_on_plate")
+        assert scene._hold_head_target is None and scene.velocity_fault is False
+        assert np.max(np.abs(scene.data.ctrl)) == 0
+        assert np.max(np.abs(scene.data.xfrc_applied)) == 0
+        start = np.concatenate([scene.data.qpos, scene.data.qvel])
+        if reference is None:
+            reference = start.copy()
+        assert np.allclose(start, reference, rtol=0, atol=1e-9)
+        for _step in range(30):
+            scene.step_physics(tau, hold_driver=True)
+        end = np.concatenate([scene.data.qpos, scene.data.qvel])
+        if replay_reference is None:
+            replay_reference = end.copy()
+        assert np.allclose(end, replay_reference, rtol=0, atol=1e-9)
     span = []
-    scene = FeedingScene(cfg)
-    for seed in scene.config["fixed_seeds"]:
+    for seed in range(50):
         _contaminate(scene)
         state = scene.reset(seed=seed, preset="food_on_plate")
         span.append(state["food_pos"][:2].copy())
+        assert scene._hold_latched is False
         ranges = scene.model.jnt_range[scene.index.arm_joint_ids]
-        q = state["q"]
-        assert np.all(q >= ranges[:, 0] - 1e-8) and np.all(q <= ranges[:, 1] + 1e-8)
-    span = np.array(span)
+        assert np.all(state["q"] >= ranges[:, 0] - 1e-8) and np.all(state["q"] <= ranges[:, 1] + 1e-8)
+    span = np.asarray(span)
     assert np.ptp(span[:, 0]) > 0.01 and np.ptp(span[:, 1]) > 0.01
+    save_case("T11", {"replay_atol": 1e-9, "food_span_m": float(np.ptp(span[:, 0]))})

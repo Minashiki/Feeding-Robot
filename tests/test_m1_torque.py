@@ -3,12 +3,13 @@
 import mujoco
 import numpy as np
 
+from feedingrobot.sim.cases import save_case
 from feedingrobot.sim.model import repo_root
 from feedingrobot.sim.scene import FeedingScene
 
 
-def _scene():
-    return FeedingScene(str(repo_root() / "configs" / "m1_scene.json"))
+def _scene(m1_config):
+    return FeedingScene(m1_config)
 
 
 def _park_food(scene):
@@ -29,9 +30,10 @@ def _set_pose(scene, q, dq=None):
     mujoco.mj_forward(scene.model, scene.data)
 
 
-def test_t02_unit_torque_three_poses():
-    scene = _scene()
+def test_t02_unit_torque_three_poses(m1_config):
+    scene = _scene(m1_config)
     poses = scene.config["q_torque_poses"]
+    max_err = 0.0
     for q in poses:
         for joint in range(7):
             for tau in (0.0, 1.0, -1.0):
@@ -43,10 +45,12 @@ def test_t02_unit_torque_three_poses():
                 got = scene.data.qfrc_actuator[scene.index.arm_dof_adr]
                 err = np.max(np.abs(got - cmd))
                 assert err <= 1e-8, (joint, tau, got, err)
+                max_err = max(max_err, float(err))
+    save_case("T02", {"max_abs_error_nm": max_err})
 
 
-def test_t02_ctrl_saturates_at_force_limit():
-    scene = _scene()
+def test_t02_ctrl_saturates_at_force_limit(m1_config):
+    scene = _scene(m1_config)
     _set_pose(scene, scene.config["q_torque_poses"][0])
     scene.data.ctrl[scene.index.arm_actuator_ids[0]] = 200.0
     scene.data.ctrl[scene.index.arm_actuator_ids[4]] = -50.0
@@ -59,8 +63,8 @@ def test_t02_ctrl_saturates_at_force_limit():
     assert abs(state["tau_command"][4] + 12.0) <= 1e-9
 
 
-def test_t03_zero_ctrl_has_no_actuator_force():
-    scene = _scene()
+def test_t03_zero_ctrl_has_no_actuator_force(m1_config):
+    scene = _scene(m1_config)
     q = np.array(scene.config["q_torque_poses"][1], dtype=float)
     for dq in (np.zeros(7), np.array([0.2, -0.1, 0.05, 0.0, -0.2, 0.1, 0.0])):
         _set_pose(scene, q, dq)
@@ -68,10 +72,11 @@ def test_t03_zero_ctrl_has_no_actuator_force():
         mujoco.mj_forward(scene.model, scene.data)
         got = scene.data.qfrc_actuator[scene.index.arm_dof_adr]
         assert np.max(np.abs(got)) <= 1e-8
+    save_case("T03", {"max_abs_actuator_nm": float(np.max(np.abs(got)))})
 
 
-def test_t04_gravity_and_compensation():
-    scene = _scene()
+def test_t04_gravity_and_compensation(m1_config):
+    scene = _scene(m1_config)
     q0 = np.array(scene.config["q_torque_poses"][0], dtype=float)
     _set_pose(scene, q0)
     q_start = scene.data.qpos[scene.index.arm_qpos_adr].copy()
@@ -99,3 +104,4 @@ def test_t04_gravity_and_compensation():
     drift = np.max(np.abs(scene.data.qpos[scene.index.arm_qpos_adr] - q_start))
     assert drift < 1e-3, drift
     scene.restore_model_options()
+    save_case("T04", {"hold_drift_rad": float(drift)})

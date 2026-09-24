@@ -1,19 +1,24 @@
-"""Run the M1 pytest suite and write a JSON report plus optional frames."""
+"""Rebuild the M1 acceptance report. A pytest pass alone does not set m2_ready."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import platform
+import struct
 import subprocess
 import sys
+import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import mujoco
 import numpy as np
 
 from feedingrobot.sim.model import load_config, repo_root
+from feedingrobot.sim.report import assess
 
 
 def _sha256(path: Path) -> str:
@@ -24,8 +29,59 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _try_frames(cfg, out: Path) -> list[str]:
-    saved = []
+def _tracked_files(root: Path) -> list[Path]:
+    paths = []
+    for folder in (root / "src" / "feedingrobot" / "sim", root / "src" / "feedingrobot" / "scripts", root / "tests"):
+        paths.extend(path for path in folder.rglob("*") if path.is_file() and path.suffix in {".py", ".xml", ".json"})
+    for extra in (
+        root / "configs" / "m1_scene.json",
+        root / "assets" / "scenes" / "feeding_p0.xml",
+        root / "assets" / "scenes" / "feeding_p0_sphere.xml",
+        root / "assets" / "scenes" / "spoon_fixture.xml",
+        root / "assets" / "robots" / "panda_torque.xml",
+        root / "third_party_manifest.json",
+    ):
+        paths.append(extra)
+    manifest = json.loads((root / "third_party_manifest.json").read_text())
+    for entry in manifest["entries"]:
+        for item in entry["files"]:
+            paths.append(root / item["local_path"])
+    unique = sorted({path.resolve() for path in paths if path.is_file()})
+    return unique
+
+
+def _bundle_hash(root: Path, files: list[Path]) -> dict:
+    rows = []
+    for path in files:
+        rel = str(path.relative_to(root))
+        rows.append({"path": rel, "sha256": _sha256(path)})
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(row["path"].encode())
+        digest.update(b"\0")
+        digest.update(row["sha256"].encode())
+        digest.update(b"\n")
+    return {"files": rows, "aggregate_sha256": digest.hexdigest()}
+
+
+def _png(path: Path, image: np.ndarray) -> None:
+    image = np.asarray(image, dtype=np.uint8)
+    height, width = image.shape[:2]
+    raw = b"".join(b"\x00" + image[y].tobytes() for y in range(height))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _render(cfg, out: Path) -> tuple[str, list[dict]]:
+    os.environ.setdefault("MUJOCO_GL", "egl")
     try:
         from feedingrobot.sim.scene import FeedingScene
 
@@ -33,81 +89,105 @@ def _try_frames(cfg, out: Path) -> list[str]:
         renderer = mujoco.Renderer(scene.model, 480, 640)
     except Exception as exc:
         (out / "render_error.txt").write_text(str(exc))
-        return saved
+        return "unavailable", []
+    index = []
     option = mujoco.MjvOption()
-    option.frame = mujoco.mjtFrame.mjFRAME_SITE
-    cases = {
-        "carry": ("food_on_spoon", 0),
-        "plate": ("food_on_plate", 0),
-        "mouth": ("near_mouth", 0),
-    }
-    for name, (preset, seed) in cases.items():
-        scene.reset(seed=seed, preset=preset)
-        renderer.update_scene(scene.data, camera="overview", scene_option=option)
-        image = renderer.render()
+    fixed = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_CAMERA, "overview")
+    shots = [
+        ("overview_visual", "food_on_plate", 2, "fixed"),
+        ("overview_collision", "food_on_plate", 3, "fixed"),
+        ("overview_scene", "food_on_plate", None, "fixed"),
+        ("spoon_close", "food_on_spoon", None, "tcp"),
+        ("plate_close", "food_on_plate", None, "plate"),
+        ("mouth_close", "near_mouth", None, "mouth"),
+    ]
+    for name, preset, group, look in shots:
+        scene.reset(seed=0, preset=preset)
+        option.geomgroup[:] = 1 if group is None else 0
+        if group is not None:
+            option.geomgroup[group] = 1
+        option.frame = mujoco.mjtFrame.mjFRAME_NONE
+        cam = mujoco.MjvCamera()
+        if look == "fixed":
+            cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+            cam.fixedcamid = fixed
+        else:
+            cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            cam.lookat[:] = {
+                "tcp": scene.data.site_xpos[scene.index.site_ids["tcp"]],
+                "plate": [0.45, -0.18, 0.05],
+                "mouth": [0.55, 0.12, 0.35],
+            }[look]
+            cam.distance = 0.45
+            cam.azimuth = 140
+            cam.elevation = -35
+        renderer.update_scene(scene.data, camera=cam, scene_option=option)
         path = out / f"{name}.png"
-        try:
-            from PIL import Image
-        except ImportError:
-            np.save(out / f"{name}.npy", image)
-            saved.append(str(out / f"{name}.npy"))
-            continue
-        Image.fromarray(image).save(path)
-        saved.append(str(path))
+        _png(path, renderer.render())
+        index.append({"file": path.name, "preset": preset, "group": group, "seed": 0})
     renderer.close()
-    return saved
+    return "passed", index
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Run M1 tests and write a traceable acceptance report.")
     parser.add_argument("--config", default="configs/m1_scene.json")
-    parser.add_argument("--output", default="outputs/m1/acceptance")
+    parser.add_argument("--output", default="outputs/m1/acceptance/m1-fix-validation")
     args = parser.parse_args()
     root = repo_root()
     out = Path(args.output)
     if not out.is_absolute():
         out = root / out
     out.mkdir(parents=True, exist_ok=True)
-    cfg = load_config(args.config)
-    (out / "m1_scene.json").write_text(json.dumps(cfg, indent=2))
+    case_dir = out / "cases"
+    case_dir.mkdir(exist_ok=True)
+    before = _bundle_hash(root, _tracked_files(root))
+    (out / "input_hash_before.json").write_text(json.dumps(before, indent=2))
+    env = os.environ.copy()
+    env["M1_CASE_DIR"] = str(case_dir)
+    env.setdefault("MUJOCO_GL", "egl")
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/test_m1_model.py", "tests/test_m1_torque.py", "tests/test_m1_wrench.py", "tests/test_m1_contacts.py", "tests/test_m1_reset.py", "tests/test_m1_long.py", "-q"],
+        [sys.executable, "-m", "pytest", "tests/test_m1_model.py", "tests/test_m1_torque.py", "tests/test_m1_wrench.py", "tests/test_m1_contacts.py", "tests/test_m1_reset.py", "tests/test_m1_long.py", "tests/test_m1_report.py", "-q", "--m1-config", args.config],
         cwd=root,
+        env=env,
         capture_output=True,
         text=True,
     )
     (out / "pytest.txt").write_text(proc.stdout + "\n" + proc.stderr)
-    model_path = root / cfg["model"]
-    report = {
-        "passed": proc.returncode == 0,
+    after = _bundle_hash(root, _tracked_files(root))
+    hashes_match = before["aggregate_sha256"] == after["aggregate_sha256"]
+    cases = {}
+    for path in sorted(case_dir.glob("*.json")):
+        row = json.loads(path.read_text())
+        cases[row["case_id"]] = row
+    cfg = load_config(args.config)
+    (out / "m1_scene.json").write_text(json.dumps(cfg, indent=2))
+    visual_status, frames = _render(cfg, out)
+    (out / "frames.json").write_text(json.dumps(frames, indent=2))
+    draft = {
+        "run_id": out.name,
+        "created": datetime.now(timezone.utc).isoformat(),
         "pytest_returncode": proc.returncode,
         "python": sys.version,
         "platform": platform.platform(),
         "mujoco": mujoco.__version__,
         "numpy": np.__version__,
-        "model_sha256": _sha256(model_path),
-        "robot_sha256": _sha256(root / "assets/robots/panda_torque.xml"),
-        "config_sha256": _sha256(root / cfg["_config_path"]),
-        "frames": _try_frames(cfg, out),
-        "interface": {
-            "step": "FeedingScene.step_physics(tau_arm) -> one physics step",
-            "tau_arm": "7-vector of joint torque, N*m, software-clipped to motor ranges",
-            "wrench_sign": cfg["wrench_sign"],
-            "compensated_wrench": None,
-        },
-        "known_limits": [
-            "compensated_wrench is absent until M2",
-            "head and jaw torques are a bounded tracking fixture inside the scene driver",
-            "diagnostic_pd_tau is a test fixture and is not the feeding controller",
-            "same-seed replay is bit-close on this machine only",
-        ],
+        "pytest": subprocess.check_output([sys.executable, "-m", "pytest", "--version"], text=True).strip(),
+        "config": args.config,
+        "aggregate_sha256": before["aggregate_sha256"],
+        "hashes_match": hashes_match,
+        "provenance_passed": hashes_match,
+        "visual_status": visual_status,
+        "cases": cases,
+        "incomplete": proc.returncode != 0 or not hashes_match,
     }
-    (out / "report.json").write_text(json.dumps(report, indent=2))
+    verdict = assess(draft)
+    draft.update(verdict)
+    (out / "report.json").write_text(json.dumps(draft, indent=2))
     print(proc.stdout)
-    if proc.returncode != 0:
-        print(proc.stderr)
-        raise SystemExit(proc.returncode)
-    print(f"wrote {out / 'report.json'}")
+    print(json.dumps({key: draft[key] for key in ("physics_passed", "provenance_passed", "visual_status", "m2_ready", "overall_status", "reasons")}, indent=2))
+    if not draft["m2_ready"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

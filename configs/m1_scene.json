@@ -7,6 +7,23 @@
   "tool_mass_kg": 0.08,
   "food_mass_kg": 0.003,
   "velocity_soft_limit_rad_s": 0.5,
+  "tilt": {"duration_s": 8.0, "kp": 20.0, "kd": 8.0},
+  "mouth_move": {"duration_s": 3.0, "kp": 30.0, "kd": 10.0},
+  "diagnostic_accel": {
+    "speed_limit_rad_s": 6.0,
+    "joint": 5,
+    "amplitude_nm": 8.0,
+    "start_s": 0.3,
+    "duration_s": 0.4,
+    "reason": "Friction 0.5 needs lateral acceleration above about 4.9 m/s^2 to slide the 12 mm cube out of the 8 mm bowl without using the slow tilt. A smooth joint-6 pulse that does this peaks near 5.4 rad/s, so this case has its own 6 rad/s limit. Carry, tilt, and mouth tests stay at 0.5 rad/s."
+  },
+  "hold_recovery": {
+    "force_n": [0.0, 0.0, 6.0],
+    "duration_s": 0.15,
+    "recover_s": 1.0,
+    "trans_tol_m": 0.001,
+    "ang_tol_rad": 0.008726646
+  },
   "settle_steps": 400,
   "head": {
     "amp_m": 0.01,

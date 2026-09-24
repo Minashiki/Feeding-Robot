@@ -3,7 +3,7 @@
   <option timestep="0.001" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" iterations="50"/>
   <default>
     <default class="tool">
-      <geom contype="1" conaffinity="1" group="3" friction="0.5 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.001" condim="3"/>
+      <geom contype="1" conaffinity="1" group="3" friction="0.5 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001" condim="3"/>
     </default>
   </default>
   <worldbody>
@@ -23,7 +23,7 @@
     <body name="food" pos="0.1345 0 0.23">
       <freejoint name="food_joint"/>
       <inertial mass="0.003" pos="0 0 0" diaginertia="7.2e-8 7.2e-8 7.2e-8"/>
-      <geom name="food_box" type="box" size="0.006 0.006 0.006" mass="0.003" friction="0.5 0.005 0.0001" solref="0.01 1" solimp="0.9 0.95 0.001" condim="3" rgba="0.85 0.45 0.15 1"/>
+      <geom name="food_box" type="box" size="0.006 0.006 0.006" mass="0.003" friction="0.5 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001" condim="3" rgba="0.85 0.45 0.15 1"/>
     </body>
   </worldbody>
   <sensor>
