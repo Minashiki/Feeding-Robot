@@ -1,0 +1,41 @@
+{
+  "version": "m2-v1",
+  "feature_length_m": 0.1,
+  "epsilon_normal": 1e-8,
+  "epsilon_singular": 1e-2,
+  "a_floor": 1e-4,
+  "a_floor_unit": "same as trace(J_s M^{-1} J_s^T)/6",
+  "rho_normal": 0.05,
+  "rho_stop": 0.01,
+  "posture": {"kq": 2.0, "dq": 1.0, "tau_limit": 2.0},
+  "tau_rate_nm_s": 2000.0,
+  "tau_rate_note": "Plan start value is 100 N m/s. Ramping the measured ~23 N m joint-2 bias from a true zero command at 100 N m/s integrates a gravity deficit that exceeds 0.5 rad/s before bias is reached. Frozen at 2000 N m/s so takeover from zero stays inside the speed and 20 mm gates. The same rate limits task torque.",
+  "joint_speed_limit_rad_s": 0.5,
+  "joint_speed_predict_rad_s": 0.4,
+  "joint_margin_slow_rad": 0.1,
+  "joint_margin_stop_rad": 0.05,
+  "power_on_s": 1.0,
+  "gain_blend_s": 0.2,
+  "filter_hz": 30.0,
+  "delay_s": 0.0,
+  "workspace_box_m": 0.05,
+  "calibrate_bias": false,
+  "press_test": false,
+  "mouth_case": false,
+  "noise": {"enable": false, "force_std": 0.02, "torque_std": 0.002, "seed": 0},
+  "blocked": {"force_n": 0.3, "error_m": 0.002, "confirm_s": 0.01, "sat_s": 0.02, "dev_s": 0.1},
+  "stop": {"speed_rad_s": 0.02, "within_s": 0.5, "hold_s": 0.2},
+  "wrench_limits": {"FREE": [8.0, 0.8], "ACQUIRE": [4.0, 0.4], "MOUTH": [2.0, 0.2], "STOP": [8.0, 0.8]},
+  "hybrid_normal_force": {"enabled": false, "f_d": 0.5, "kf": 0.2, "ki": 0.0, "u_max": 2.0},
+  "contact": {
+    "bowl_geoms": ["bowl_bottom", "bowl_back", "bowl_left", "bowl_right", "bowl_front"],
+    "plate_work_geoms": ["plate_bottom"],
+    "mouth_geoms": ["jaw_lip"]
+  },
+  "gears": {
+    "FREE": {"kp": 300.0, "kr": 8.0, "dp": 49.0, "dr": 0.8, "v": 0.05, "w": 0.3, "a": 0.25, "alpha": 1.5, "pos_dev_m": 0.02, "rot_dev_rad": 0.13962634},
+    "ACQUIRE": {"kp": 150.0, "kr": 5.0, "dp": 35.0, "dr": 0.63, "v": 0.02, "w": 0.15, "a": 0.1, "alpha": 0.75, "pos_dev_m": 0.01, "rot_dev_rad": 0.08726646},
+    "MOUTH": {"kp": 100.0, "kr": 3.0, "dp": 28.0, "dr": 0.49, "v": 0.01, "w": 0.1, "a": 0.05, "alpha": 0.5, "pos_dev_m": 0.005, "rot_dev_rad": 0.05235988},
+    "STOP": {"kp": 0.0, "kr": 0.0, "dp": 0.0, "dr": 0.0, "v": 0.0, "w": 0.0, "a": 0.0, "alpha": 0.0, "pos_dev_m": 0.02, "rot_dev_rad": 0.13962634}
+  }
+}
