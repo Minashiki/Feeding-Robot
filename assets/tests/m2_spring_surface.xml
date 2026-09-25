@@ -2,7 +2,7 @@
   <include file="../scenes/feeding_p0.xml"/>
   <worldbody>
     <!-- Vertical pad, slide along +Y. Outward normal points toward +Y, at the bowl of pose 0. -->
-    <body name="spring_mount" pos="0.778 -0.130 0.554">
+    <body name="spring_mount" pos="0.778 -0.120 0.554">
       <body name="spring_slider" pos="0 0 0">
         <inertial pos="0 0 0" mass="0.1" diaginertia="0.0002 0.0002 0.0002"/>
         <joint name="spring_slide" type="slide" axis="0 1 0" limited="true" range="0 0.02" stiffness="500" damping="14.1421356"/>

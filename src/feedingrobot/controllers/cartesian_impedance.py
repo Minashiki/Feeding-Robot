@@ -91,6 +91,7 @@ class CartesianImpedance:
         self._gear_next = "FREE"
         self._blend = 1.0
         self.transition_elapsed = float(self.blend_s)
+        self.transition_active = False
         self._k = self._vector_gain("FREE")
         self._d = self._vector_damp("FREE")
         self.k_start = self._k.copy()
@@ -126,6 +127,7 @@ class CartesianImpedance:
         self.d_start = self._d.copy()
         self.limits_start = self._limits(self.active_gear)
         self.transition_elapsed = float(self.blend_s)
+        self.transition_active = False
         self.sim_time = float(state.get("episode_time", 0.0))
         if self.guard is not None:
             self.guard.reset()
@@ -240,12 +242,13 @@ class CartesianImpedance:
             self.limits_start = self.effective_limits()
             self.target_gear = target
             self.transition_elapsed = 0.0
+            self.transition_active = True
             new_limits = self._limits(target)
             err = self.reference.p_ref - self._tcp_pos
             ori = float(np.linalg.norm(orientation_error(self.reference.r_ref, self._tcp_rot)))
             if float(np.linalg.norm(err)) > new_limits["pos_dev"] or ori > new_limits["rot_dev"]:
                 self.reference.reanchor(self._tcp_pos, self._tcp_rot)
-        if self.target_gear != self.active_gear:
+        if self.transition_active:
             self.transition_elapsed = min(self.blend_s, self.transition_elapsed + dt)
             span = max(self.blend_s, 1e-9)
             mix = min(self.transition_elapsed / span, 1.0)
@@ -253,17 +256,16 @@ class CartesianImpedance:
             self._d = (1.0 - mix) * self.d_start + mix * self._vector_damp(self.target_gear)
             self._blend = mix
             if mix >= 1.0 - 1e-15:
+                self.transition_active = False
                 self.active_gear = self.target_gear
                 self.limits_start = self._limits(self.active_gear)
-        else:
-            self._k = self._vector_gain(self.active_gear)
-            self._d = self._vector_damp(self.active_gear)
-            self._blend = 1.0
+                self._k = self._vector_gain(self.active_gear)
+                self._d = self._vector_damp(self.active_gear)
         self._gear_now = self.active_gear
         self._gear_next = self.target_gear
 
     def effective_limits(self) -> dict:
-        if self.target_gear == self.active_gear or self.target_gear not in self.gears:
+        if not self.transition_active or self.target_gear not in self.gears:
             gear = self.active_gear if self.active_gear in self.gears else "FREE"
             return self._limits(gear)
         return {key: min(self.limits_start[key], self._limits(self.target_gear)[key]) for key in self.limits_start}
@@ -283,31 +285,23 @@ class CartesianImpedance:
         return full[np.ix_(cols, cols)].copy()
 
     def _joint_scale(self, jbar: np.ndarray, twist: np.ndarray, q: np.ndarray) -> float:
-        scale_mat = np.diag([1, 1, 1, self.length, self.length, self.length])
-        pred = jbar @ (scale_mat @ twist)
-        scale = 1.0
-        peak = float(np.max(np.abs(pred))) if pred.size else 0.0
-        if peak > self.speed_predict:
-            scale = self.speed_predict / peak
-        pred = pred * scale
+        """Uniform scale of one candidate twist. 0.4 rad/s, softer inside 0.10 rad, zero inside 0.05 rad."""
+        scale_mat = np.diag([1.0, 1.0, 1.0, self.length, self.length, self.length])
+        pred = np.asarray(jbar, dtype=float) @ (scale_mat @ np.asarray(twist, dtype=float).reshape(6))
+        beta = 1.0
         for i in range(_ARM):
             vel = float(pred[i])
-            if vel > 0:
-                dist = float(self.ranges[i, 1] - q[i])
-            elif vel < 0:
-                dist = float(q[i] - self.ranges[i, 0])
-            else:
+            if abs(vel) <= 1e-12:
                 continue
-            if dist <= self.margin_stop:
-                return 0.0
-            if dist < self.margin_slow:
+            dist = float(self.ranges[i, 1] - q[i]) if vel > 0 else float(q[i] - self.ranges[i, 0])
+            if dist >= self.margin_slow:
+                allow = self.speed_predict
+            elif dist <= self.margin_stop:
+                allow = 0.0
+            else:
                 allow = self.speed_predict * (dist - self.margin_stop) / (self.margin_slow - self.margin_stop)
-                if abs(vel) > allow > 0:
-                    scale *= allow / abs(vel)
-                    pred *= allow / abs(vel)
-                elif allow <= 0:
-                    return 0.0
-        return float(np.clip(scale, 0.0, 1.0))
+            beta = min(beta, allow / abs(vel))
+        return float(np.clip(beta, 0.0, 1.0))
 
     def compute(self, state: dict, dt: float) -> tuple[np.ndarray, dict]:
         dt = float(dt)
@@ -371,9 +365,12 @@ class CartesianImpedance:
             execution = "zero"
         else:
             execution = "run"
-        joint_scale = 0.0 if cmd_scale <= 0 else self._joint_scale(jbar, twist, q)
         cached = self.wrench._cache
         force = np.zeros(3) if cached is None else np.asarray(cached["compensated_wrench_tcp"][:3], dtype=float)
+
+        def project(candidate):
+            return self._joint_scale(jbar, candidate, q)
+
         shaped = self.reference.shape(
             twist,
             self._tcp_pos,
@@ -382,10 +379,11 @@ class CartesianImpedance:
             dt,
             limits,
             cmd_scale,
-            joint_scale,
+            1.0,
             active=execution in {"run", "zero"},
             saturated=bool(self._pause_advance) and not self.power_on,
             execution=execution,
+            project=None if execution != "run" else project,
         )
         e = np.concatenate(
             [
@@ -487,6 +485,13 @@ class CartesianImpedance:
             "tau_before": tau_before.copy(),
             "e": e.copy(),
             "execution": execution,
+            "beta": float(shaped.get("beta", 1.0)),
+            "v_hist": np.asarray(shaped.get("v_hist", np.zeros(6)), dtype=float),
+            "qdot_pred": jbar @ (scale_mat @ np.asarray(shaped.get("v_hist", np.zeros(6)), dtype=float)),
+            "reference_correction_pos": np.asarray(shaped.get("reference_correction_pos", np.zeros(3)), dtype=float),
+            "reference_correction_rot": float(shaped.get("reference_correction_rot", 0.0)),
+            "correction_reason": shaped.get("correction_reason"),
+            "transition_active": bool(self.transition_active),
         }
         return tau_cmd, info
 

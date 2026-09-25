@@ -148,6 +148,82 @@ def test_f3_force_pulse_latches_on_the_post_step_sample():
     assert ctl.wrench.filter_updates == updates + 2
 
 
+def test_v2_f5_return_to_free_is_continuous():
+    scene = FeedingScene("configs/m1_scene.json")
+    cfg = load_m2_config()
+    state = place_arm(scene, scene.config["q_torque_poses"][0])
+    ctl, _guard = start_controller(scene, cfg, state)
+    ctl.power_on = False
+    ctl.phase = "APPROACH"
+    ctl._tcp_pos = state["tcp_pos"]
+    ctl._tcp_rot = state["tcp_mat"]
+    ctl._update_gains(0.05)
+    assert abs(ctl._k[0] - 250.0) < 1e-9
+    ctl.phase = "TRANSPORT"
+    ctl._update_gains(0.001)
+    assert abs(ctl._k[0] - 250.25) < 1e-9
+    ctl2, _g2 = start_controller(scene, cfg, state)
+    ctl2.power_on = False
+    ctl2.phase = "APPROACH"
+    ctl2._tcp_pos = state["tcp_pos"]
+    ctl2._tcp_rot = state["tcp_mat"]
+    ctl2._update_gains(0.05)
+    ctl2.phase = "TRANSPORT"
+    ctl2._update_gains(0.0005)
+    assert abs(ctl2._k[0] - 250.125) < 1e-9
+
+
+def test_v2_f6_pause_still_limits_deviation():
+    cfg = load_m2_config()
+    shaper = ReferenceShaper(cfg)
+    shaper.anchor_pose(np.zeros(3), np.eye(3), np.zeros(7))
+    limits = _limits()
+    limits["pos_dev"] = 0.02
+    out = shaper.shape(np.zeros(6), np.array([0.03, 0.0, 0.0]), np.eye(3), np.zeros(3), 0.001, limits, 1.0, 1.0, True, True, "run")
+    assert np.max(np.abs(out["p_ref"] - np.array([0.01, 0.0, 0.0]))) <= 1e-9
+    assert np.linalg.norm(out["p_ref"] - np.array([0.03, 0.0, 0.0])) <= 0.02 + 1e-9
+    assert np.max(np.abs(out["reference_correction_pos"] - np.array([0.01, 0.0, 0.0]))) <= 1e-9
+    assert np.linalg.norm(out["v_ref"]) == 0.0
+    assert np.linalg.norm(out["v_hist"]) == 0.0
+    held = ReferenceShaper(cfg)
+    held.anchor_pose(np.zeros(3), np.eye(3), np.zeros(7))
+    small = held.shape(np.zeros(6), np.array([0.005, 0, 0]), np.eye(3), np.zeros(3), 0.001, limits, 1.0, 1.0, True, True, "run")
+    assert np.linalg.norm(small["p_ref"]) <= 1e-12
+
+
+def test_v2_f4_final_candidate_respects_joint_limit():
+    scene = FeedingScene("configs/m1_scene.json")
+    cfg = load_m2_config()
+    q = np.array(scene.config["q_torque_poses"][0], dtype=float)
+    q[0] = float(scene.model.jnt_range[scene.index.arm_joint_ids[0], 1] - 0.04)
+    state = place_arm(scene, q)
+    ctl, _guard = start_controller(scene, cfg, state)
+    ctl.power_on = False
+    jac, _bias = ctl._jacobian()
+    mass = ctl._mass()
+    scale = np.diag([1, 1, 1, 0.1, 0.1, 0.1])
+    _null, jbar, _lam = __import__("feedingrobot.controllers.cartesian_impedance", fromlist=["damped_nullspace"]).damped_nullspace(scale @ jac, mass, 1e-8, 1e-4)
+    outward = np.zeros(6)
+    inward = np.zeros(6)
+    for trial in (np.eye(3)[i] for i in range(3)):
+        for sign in (1.0, -1.0):
+            twist = np.zeros(6)
+            twist[:3] = sign * trial
+            pred = jbar @ (scale @ twist)
+            if pred[0] > 0.01:
+                outward = twist
+            if pred[0] < -0.01:
+                inward = twist
+    assert outward[0] != 0.0 or np.any(outward)
+    shaper = ctl.reference
+    shaper.v_lin[:] = outward[:3] * 0.05
+    raw = jbar @ (scale @ np.concatenate([shaper.v_lin, shaper.v_ang]))
+    assert raw[0] > 1e-6
+    out = shaper.shape(inward, state["tcp_pos"], state["tcp_mat"], np.zeros(3), 0.001, _limits(), 1.0, 1.0, True, False, "run", project=lambda v: ctl._joint_scale(jbar, v, q))
+    final = jbar @ (scale @ out["v_hist"])
+    assert final[0] <= 1e-9
+
+
 def test_f6_commit_uses_applied_torque_and_pauses():
     scene = FeedingScene("configs/m1_scene.json")
     cfg = load_m2_config()

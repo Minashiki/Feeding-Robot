@@ -14,7 +14,9 @@ guard.observe(next_state, info["phase_k"], info)
 
 保护力是步后样本 `S_{k+1}` 的未滤波补偿力。`compute` 只用上一份已缓存的测量，不在同一次计算里再推进滤波器。
 
-阶段 `SELECT` / `TRANSPORT` / `WAIT_READY` 用 FREE 档，`ACQUIRE` 用取餐档，`APPROACH` / `TRANSFER` / `RETRACT` 用 MOUTH 档。更严的速度和偏差限制在切换时立即生效，刚度在 0.2 s 内插值。
+阶段 `SELECT` / `TRANSPORT` / `WAIT_READY` 用 FREE 档，`ACQUIRE` 用取餐档，`APPROACH` / `TRANSFER` / `RETRACT` 用 MOUTH 档。新目标从当前刚度和阻尼开始，0.2 s 线性插到目标；切回原档位也是一次新过渡，不会跳回原档增益。过渡期间速度和偏差取起点限制与目标限制中更严的一组，过渡结束后才用目标档的完整限制。力与接触规则仍按当前阶段立即生效。
+
+关节速度约束作用在加速度整形、受阻抑制和工作空间裁剪之后的最终候选上，用同一个标量缩放六维速度。饱和暂停、禁止推进、上电和停止都不积分任务位移，但仍然把参考位姿收到当前档的偏差上限内。校正量单独记录，该步参考速度为 0。
 
 reset 后力矩从给定的 `tau_applied`（场景复位后为 0）按变化率爬升，最多 1 s。这段时间不积分任务 twist。故障后下一控制周期改为 bias 加关节阻尼，不再跟踪旧参考。`ABORTED` 表示非有限状态或 MuJoCo warning，调用方应停止仿真。
 

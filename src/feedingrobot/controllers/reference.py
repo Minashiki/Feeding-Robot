@@ -47,6 +47,9 @@ class ReferenceShaper:
         self.reanchored = False
         self.clipped_offset = np.zeros(3)
         self.constraint_reset = None
+        self.reference_correction_pos = np.zeros(3)
+        self.reference_correction_rot = 0.0
+        self.correction_reason = None
         self._sat_time = 0.0
 
     def anchor_pose(self, pos: np.ndarray, rot: np.ndarray, q: np.ndarray) -> None:
@@ -113,6 +116,7 @@ class ReferenceShaper:
         active: bool,
         saturated: bool,
         execution: str = "run",
+        project=None,
     ) -> dict:
         """Integrate one step.
 
@@ -121,55 +125,69 @@ class ReferenceShaper:
         """
         self.reanchored = False
         self.constraint_reset = None
+        self.reference_correction_pos = np.zeros(3)
+        self.reference_correction_rot = 0.0
+        self.correction_reason = None
+        beta = 1.0
         twist = np.asarray(twist, dtype=float).reshape(6)
-        if execution in {"power_on", "stop", "prohibit"} or (not active and execution != "zero"):
+        lin = np.zeros(3)
+        ang = np.zeros(3)
+        blocked_now = False
+        integrate = False
+        envelope = dict(limits)
+        if execution in {"power_on", "stop", "prohibit"} or (not active and execution != "zero") or saturated or float(scale) <= 0.0:
             self.v_lin[:] = 0.0
             self.v_ang[:] = 0.0
-            if execution == "prohibit":
+            if saturated:
+                self.constraint_reset = "saturation_pause"
+            elif execution == "prohibit" or float(scale) <= 0.0:
                 self.constraint_reset = "prohibit"
-            return self._pack(np.zeros(3), np.zeros(3), 0.0, False)
-        if saturated:
-            self.v_lin[:] = 0.0
-            self.v_ang[:] = 0.0
-            self.constraint_reset = "saturation_pause"
-            return self._pack(np.zeros(3), np.zeros(3), 0.0, False)
-        if not active:
-            twist = np.zeros(6)
-            execution = "zero"
-        scale = float(np.clip(scale, 0.0, 1.0)) * float(np.clip(joint_scale, 0.0, 1.0))
-        if scale <= 0.0:
-            self.v_lin[:] = 0.0
-            self.v_ang[:] = 0.0
-            self.constraint_reset = "prohibit"
-            return self._pack(np.zeros(3), np.zeros(3), 0.0, False)
-        self.constraint_reset = self._project_history(limits)
-        lin = _limit_norm(twist[:3], limits["v"]) * scale
-        ang = _limit_norm(twist[3:], limits["w"]) * scale
-        lin = _accel_limit(self.v_lin, lin, limits["a"], dt)
-        ang = _accel_limit(self.v_ang, ang, limits["alpha"], dt)
-        lin = _limit_norm(lin, limits["v"])
-        ang = _limit_norm(ang, limits["w"])
-        lin, ang, blocked_now = self._suppress(lin, ang, pos, rot, force, dt, limits, saturated, active)
-        self.v_lin = lin
-        self.v_ang = ang
-        prev_p = self.p_ref.copy()
-        prev_r = self.r_ref.copy()
-        if self.anchor is not None and self.box > 0:
-            trial = prev_p + lin * dt
-            delta = trial - self.anchor
-            excess = np.abs(delta) - self.box
-            if np.any(excess > 0):
+        else:
+            factor = float(np.clip(scale, 0.0, 1.0)) * float(np.clip(joint_scale, 0.0, 1.0))
+            envelope["v"] = float(limits["v"]) * factor
+            envelope["w"] = float(limits["w"]) * factor
+            if not active:
+                twist = np.zeros(6)
+            self.constraint_reset = self._project_history(envelope)
+            lin = _limit_norm(twist[:3], envelope["v"])
+            ang = _limit_norm(twist[3:], envelope["w"])
+            lin = _accel_limit(self.v_lin, lin, limits["a"], dt)
+            ang = _accel_limit(self.v_ang, ang, limits["alpha"], dt)
+            lin = _limit_norm(lin, envelope["v"])
+            ang = _limit_norm(ang, envelope["w"])
+            lin, ang, blocked_now = self._suppress(lin, ang, pos, rot, force, dt, limits, saturated, active)
+            if self.anchor is not None and self.box > 0:
+                trial = self.p_ref + lin * dt
+                excess = np.abs(trial - self.anchor) - self.box
                 for i in range(3):
                     if excess[i] > 0 and abs(lin[i]) > 1e-15:
-                        room = self.box - abs(prev_p[i] - self.anchor[i])
+                        room = self.box - abs(self.p_ref[i] - self.anchor[i])
                         lin[i] = np.sign(lin[i]) * max(room, 0.0) / dt
-                self.v_lin = lin
-        self.p_ref = prev_p + lin * dt
-        self.r_ref = integrate_rotation(prev_r, ang, dt)
+            if project is not None:
+                beta = float(np.clip(project(np.concatenate([lin, ang])), 0.0, 1.0))
+                lin = lin * beta
+                ang = ang * beta
+                if beta <= 1e-15:
+                    lin = np.zeros(3)
+                    ang = np.zeros(3)
+                    self.constraint_reset = "joint_limit"
+            integrate = True
+        prev_p = None if self.p_ref is None else self.p_ref.copy()
+        prev_r = None if self.r_ref is None else self.r_ref.copy()
+        if integrate and prev_p is not None:
+            self.p_ref = prev_p + lin * dt
+            self.r_ref = integrate_rotation(prev_r, ang, dt)
         self._clip_deviation(pos, rot, limits, dt)
-        if self.reanchored:
+        if float(np.linalg.norm(self.reference_correction_pos)) > 1e-15 or self.reference_correction_rot > 1e-15:
+            self.correction_reason = "saturation_deviation"
+            self.reanchored = True
+        if self.reanchored or not integrate:
+            self.v_lin[:] = 0.0
+            self.v_ang[:] = 0.0
             v_ref = np.zeros(6)
         else:
+            self.v_lin = lin
+            self.v_ang = ang
             v_ref = np.concatenate([(self.p_ref - prev_p) / dt, so3_log(self.r_ref @ prev_r.T) / dt])
         return {
             "twist_limited": np.concatenate([lin, ang]),
@@ -183,6 +201,10 @@ class ReferenceShaper:
             "scale": scale,
             "constraint_reset": self.constraint_reset,
             "v_hist": np.concatenate([self.v_lin, self.v_ang]),
+            "reference_correction_pos": np.array(self.reference_correction_pos, dtype=float).copy(),
+            "reference_correction_rot": float(self.reference_correction_rot),
+            "correction_reason": self.correction_reason,
+            "beta": float(beta),
         }
 
     def _suppress(self, lin, ang, pos, rot, force, dt, limits, saturated, active):
@@ -223,20 +245,20 @@ class ReferenceShaper:
         return lin, ang, blocked_now
 
     def _clip_deviation(self, pos, rot, limits, dt):
-        err = self.p_ref - np.asarray(pos, dtype=float)
+        del dt
+        if self.p_ref is None or not np.all(np.isfinite(pos)) or not np.all(np.isfinite(rot)):
+            return
+        old = self.p_ref.copy()
+        err = old - np.asarray(pos, dtype=float)
         n = float(np.linalg.norm(err))
-        if n > limits["pos_dev"] and n > 0:
-            self.clipped_offset = err * (1.0 - limits["pos_dev"] / n)
-            self.p_ref = np.asarray(pos, dtype=float) + err * (limits["pos_dev"] / n)
-            if n - limits["pos_dev"] > 1e-4:
-                self.reanchored = True
-                self.v_lin[:] = 0
-                self.v_ang[:] = 0
+        if n > float(limits["pos_dev"]) + 1e-12:
+            self.p_ref = np.asarray(pos, dtype=float) + err * (float(limits["pos_dev"]) / n)
+            self.reference_correction_pos = self.p_ref - old
+            self.clipped_offset = old - self.p_ref
+            self.reanchored = True
         e_r = orientation_error(self.r_ref, rot)
         ang = float(np.linalg.norm(e_r))
-        if ang > limits["rot_dev"] > 0:
-            self.r_ref = integrate_rotation(rot, e_r, limits["rot_dev"] / ang)
+        if ang > float(limits["rot_dev"]) + 1e-12:
+            self.r_ref = integrate_rotation(rot, e_r, float(limits["rot_dev"]) / ang)
+            self.reference_correction_rot = ang - float(limits["rot_dev"])
             self.reanchored = True
-            self.v_lin[:] = 0
-            self.v_ang[:] = 0
-            del dt
