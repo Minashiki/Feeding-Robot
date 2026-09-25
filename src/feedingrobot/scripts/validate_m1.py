@@ -18,7 +18,7 @@ import mujoco
 import numpy as np
 
 from feedingrobot.sim.model import load_config, repo_root
-from feedingrobot.sim.report import assess
+from feedingrobot.sim.report import assess_run
 
 
 def _sha256(path: Path) -> str:
@@ -29,25 +29,42 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _tracked_files(root: Path) -> list[Path]:
-    paths = []
+def _tracked_files(root: Path, config_path: Path) -> list[Path]:
+    import re
+
+    required = [config_path.resolve()]
+    for rel in ("pyproject.toml", "requirements.txt", "third_party_manifest.json"):
+        required.append((root / rel).resolve())
     for folder in (root / "src" / "feedingrobot" / "sim", root / "src" / "feedingrobot" / "scripts", root / "tests"):
-        paths.extend(path for path in folder.rglob("*") if path.is_file() and path.suffix in {".py", ".xml", ".json"})
-    for extra in (
-        root / "configs" / "m1_scene.json",
-        root / "assets" / "scenes" / "feeding_p0.xml",
-        root / "assets" / "scenes" / "feeding_p0_sphere.xml",
-        root / "assets" / "scenes" / "spoon_fixture.xml",
-        root / "assets" / "robots" / "panda_torque.xml",
-        root / "third_party_manifest.json",
-    ):
-        paths.append(extra)
+        required.extend(path.resolve() for path in folder.rglob("*") if path.is_file() and path.suffix in {".py", ".xml", ".json"})
+    cfg = json.loads(config_path.read_text())
+    for key in ("model", "fixture", "sphere_model"):
+        required.append((root / cfg[key]).resolve())
+    pending = [path for path in required if path.suffix == ".xml"]
+    seen = set()
+    while pending:
+        xml = pending.pop()
+        if xml in seen:
+            continue
+        seen.add(xml)
+        text = xml.read_text()
+        mesh_match = re.search(r"""meshdir=["']([^"']+)["']""", text)
+        meshdir = (xml.parent / mesh_match.group(1)).resolve() if mesh_match else xml.parent
+        for match in re.findall(r"""file=["']([^"']+)["']""", text):
+            child = (xml.parent / match).resolve()
+            if not child.is_file():
+                child = (meshdir / match).resolve()
+            required.append(child)
+            if child.suffix == ".xml":
+                pending.append(child)
     manifest = json.loads((root / "third_party_manifest.json").read_text())
     for entry in manifest["entries"]:
         for item in entry["files"]:
-            paths.append(root / item["local_path"])
-    unique = sorted({path.resolve() for path in paths if path.is_file()})
-    return unique
+            required.append((root / item["local_path"]).resolve())
+    missing = sorted({str(path.relative_to(root)) for path in required if not path.is_file()})
+    if missing:
+        raise SystemExit("missing required input: " + missing[0])
+    return sorted(set(required))
 
 
 def _bundle_hash(root: Path, files: list[Path]) -> dict:
@@ -138,13 +155,21 @@ def main():
     out = Path(args.output)
     if not out.is_absolute():
         out = root / out
-    out.mkdir(parents=True, exist_ok=True)
+    if (out / "run.json").exists() or (out / "report.json").exists() or (out / "cases").exists():
+        raise SystemExit(f"refusing to reuse {out}; choose a new output directory")
+    out.mkdir(parents=True)
     case_dir = out / "cases"
-    case_dir.mkdir(exist_ok=True)
-    before = _bundle_hash(root, _tracked_files(root))
+    case_dir.mkdir()
+    run_id = out.name
+    (out / "run.json").write_text(json.dumps({"schema_version": 2, "run_id": run_id, "status": "running", "incomplete": True}))
+    before = _bundle_hash(root, _tracked_files(root, (root / args.config).resolve()))
     (out / "input_hash_before.json").write_text(json.dumps(before, indent=2))
     env = os.environ.copy()
     env["M1_CASE_DIR"] = str(case_dir)
+    env["M1_RUN_DIR"] = str(out)
+    env["M1_RUN_ID"] = run_id
+    env["M1_EXECUTION_PATH"] = str(out / "execution.json")
+    env["M1_CONFIG_PATH"] = args.config
     env.setdefault("MUJOCO_GL", "egl")
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "tests/test_m1_model.py", "tests/test_m1_torque.py", "tests/test_m1_wrench.py", "tests/test_m1_contacts.py", "tests/test_m1_reset.py", "tests/test_m1_long.py", "tests/test_m1_report.py", "-q", "--m1-config", args.config],
@@ -154,36 +179,29 @@ def main():
         text=True,
     )
     (out / "pytest.txt").write_text(proc.stdout + "\n" + proc.stderr)
-    after = _bundle_hash(root, _tracked_files(root))
+    tracked = _tracked_files(root, (root / args.config).resolve())
+    after = _bundle_hash(root, tracked)
     hashes_match = before["aggregate_sha256"] == after["aggregate_sha256"]
-    cases = {}
-    for path in sorted(case_dir.glob("*.json")):
-        row = json.loads(path.read_text())
-        cases[row["case_id"]] = row
     cfg = load_config(args.config)
-    (out / "m1_scene.json").write_text(json.dumps(cfg, indent=2))
+    (out / "config_snapshot.json").write_text(json.dumps(cfg, indent=2))
     visual_status, frames = _render(cfg, out)
     (out / "frames.json").write_text(json.dumps(frames, indent=2))
-    draft = {
-        "run_id": out.name,
-        "created": datetime.now(timezone.utc).isoformat(),
+    final_hash = _bundle_hash(root, tracked)
+    hashes_match = before["aggregate_sha256"] == after["aggregate_sha256"] == final_hash["aggregate_sha256"]
+    (out / "input_hash_after.json").write_text(json.dumps(final_hash, indent=2))
+    status = "completed" if proc.returncode == 0 and hashes_match else "failed"
+    (out / "run.json").write_text(json.dumps({
+        "schema_version": 2,
+        "run_id": run_id,
+        "status": status,
+        "incomplete": status != "completed",
+        "finished": datetime.now(timezone.utc).isoformat(),
         "pytest_returncode": proc.returncode,
-        "python": sys.version,
-        "platform": platform.platform(),
-        "mujoco": mujoco.__version__,
-        "numpy": np.__version__,
-        "pytest": subprocess.check_output([sys.executable, "-m", "pytest", "--version"], text=True).strip(),
-        "config": args.config,
-        "aggregate_sha256": before["aggregate_sha256"],
-        "hashes_match": hashes_match,
-        "provenance_passed": hashes_match,
         "visual_status": visual_status,
-        "cases": cases,
-        "incomplete": proc.returncode != 0 or not hashes_match,
-    }
-    verdict = assess(draft)
-    draft.update(verdict)
-    (out / "report.json").write_text(json.dumps(draft, indent=2))
+    }))
+    verdict = assess_run(out)
+    (out / "report.json").write_text(json.dumps({"run_id": run_id, **verdict}, indent=2))
+    draft = {"run_id": run_id, **verdict}
     print(proc.stdout)
     print(json.dumps({key: draft[key] for key in ("physics_passed", "provenance_passed", "visual_status", "m2_ready", "overall_status", "reasons")}, indent=2))
     if not draft["m2_ready"]:

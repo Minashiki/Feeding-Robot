@@ -51,6 +51,8 @@ def read_contacts(model, data) -> list[dict]:
             {
                 "geom1": n1,
                 "geom2": n2,
+                "geom1_id": int(con.geom1),
+                "geom2_id": int(con.geom2),
                 "group1": geom_group(n1),
                 "group2": geom_group(n2),
                 "dist": float(con.dist),

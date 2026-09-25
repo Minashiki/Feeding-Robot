@@ -194,12 +194,24 @@ class FeedingScene:
             self.speed_limit = float(speed_limit)
 
     def effective_options(self) -> dict:
+        contact = {}
+        for geom_name in ("food_box", "bowl_bottom", "bowl_front", "plate_bottom"):
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, geom_name)
+            if gid < 0:
+                continue
+            contact[geom_name] = {
+                "friction": np.array(self.model.geom_friction[gid], dtype=float).tolist(),
+                "solref": np.array(self.model.geom_solref[gid], dtype=float).tolist(),
+                "solimp": np.array(self.model.geom_solimp[gid], dtype=float).tolist(),
+            }
         return {
             "timestep": float(self.model.opt.timestep),
             "iterations": int(self.model.opt.iterations),
             "tolerance": float(self.model.opt.tolerance),
+            "cone": int(self.model.opt.cone),
             "speed_limit": float(self.speed_limit),
             "gravity": np.array(self.model.opt.gravity, dtype=float).tolist(),
+            "contact": contact,
         }
 
     def step_physics(self, tau_arm, hold_driver: bool = False) -> dict:

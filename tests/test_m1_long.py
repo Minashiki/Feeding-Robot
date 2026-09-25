@@ -52,163 +52,173 @@ def test_t12_nominal_10s(m1_config):
         assert min((c["dist"] for c in state["contacts"]), default=0.0) > -1e-3
     ranges = scene.model.jnt_range[scene.index.arm_joint_ids]
     assert np.all(state["q"] > ranges[:, 0] - 1e-4) and np.all(state["q"] < ranges[:, 1] + 1e-4)
-    save_case("T12", {"final_min_dist": float(min(c["dist"] for c in state["contacts"]))})
+    save_case(
+        "T12",
+        {"final_min_dist_m": float(min(c["dist"] for c in state["contacts"]))},
+        thresholds={"min_contact_dist_m": -0.001},
+        effective_config={"preset": "food_on_plate", "seed": 4},
+        duration_s=10.0,
+    )
 
 
-def _pair_force(contacts, group, partner):
-    total = np.zeros(3)
-    peak = 0.0
-    for row in contacts:
-        if {row["group1"], row["group2"]} != {group, partner}:
-            continue
-        force = row["force_on_geom1_world"] if row["group1"] == group else row["force_on_geom2_world"]
-        total = total + force
-        peak = max(peak, float(np.linalg.norm(force)))
-    return total, peak
+THRESHOLDS = {
+    "event_s": 0.02,
+    "steady_force_n": {"floor": 0.001, "frac": 0.1},
+    "peak_force_n": {"floor": 0.02, "frac": 0.1},
+    "vector_impulse_ns": {"floor": 1e-4, "frac": 0.1},
+    "scalar_impulse_ns": {"floor": 1e-4, "frac": 0.1},
+    "steady_food_pos_m": 0.002,
+    "min_contact_dist_m": -0.001,
+}
+
+
+def _close(a, b, floor, frac):
+    return abs(a - b) <= max(floor, frac * max(abs(a), abs(b)))
+
+
+def _comparison(kind, seed, pair, ref, cmp_, steady_ok, peak_ok, vec_ok, sca_ok):
+    event_a = None if ref["event_s"] is None else float(ref["event_s"])
+    event_b = None if cmp_["event_s"] is None else float(cmp_["event_s"])
+    return {
+        "kind": kind,
+        "seed": int(seed),
+        "pair": pair,
+        "steady_ok": bool(steady_ok),
+        "peak_ok": bool(peak_ok),
+        "vector_impulse_ok": bool(vec_ok),
+        "scalar_impulse_ok": bool(sca_ok),
+        "event_a": event_a,
+        "event_b": event_b,
+        "delta_event_s": None if event_a is None or event_b is None else abs(event_a - event_b),
+        "peak_a": float(ref["peak_force_n"]),
+        "peak_b": float(cmp_["peak_force_n"]),
+        "steady_a": ref["steady_force_n"],
+        "steady_b": cmp_["steady_force_n"],
+        "vector_a": ref["vector_impulse_ns"],
+        "vector_b": cmp_["vector_impulse_ns"],
+        "scalar_a": float(ref["scalar_impulse_ns"]),
+        "scalar_b": float(cmp_["scalar_impulse_ns"]),
+        "thresholds": THRESHOLDS,
+        "conclusion": "passed" if steady_ok and peak_ok and vec_ok and sca_ok else "failed",
+    }
 
 
 def test_t13_t14_contact_matrix(m1_config):
-    from feedingrobot.sim.cases import save_case
-    from feedingrobot.sim.trajectory import quintic, smooth_pulse
-    from feedingrobot.sim.trial import Trial
+    import json
+    import os
+    from pathlib import Path
 
-    configs = {
-        "A": {"timestep": 0.001, "iterations": 50, "tolerance": None},
-        "B": {"timestep": 0.0005, "iterations": 50, "tolerance": None},
-        "C": {"timestep": 0.001, "iterations": 100, "tolerance": 0.1},
+    import mujoco
+
+    from feedingrobot.sim.cases import save_dynamic
+    from feedingrobot.sim.matrix import capture_state, run_case, state_digest
+
+    solvers = {
+        "A": {"timestep": 0.001, "iterations": 50, "tolerance_scale": 1.0},
+        "B": {"timestep": 0.0005, "iterations": 50, "tolerance_scale": 1.0},
+        "C": {"timestep": 0.001, "iterations": 100, "tolerance_scale": 0.1},
+        "D": {"timestep": 0.00025, "iterations": 50, "tolerance_scale": 1.0},
     }
     scene = FeedingScene(m1_config)
     base_tol = float(scene.model.opt.tolerance)
-    results = []
-
-    def run(seed, kind):
-        trial = Trial(scene.speed_limit)
-        forces = []
-        times = []
-        food = []
-        event = None
-        off = 0
-        q0 = scene.data.qpos[scene.index.arm_qpos_adr].copy()
-        for k in range(int(round(run.duration / scene.model.opt.timestep))):
-            t = k * scene.model.opt.timestep
-            if kind == "tilt":
-                q_ref, dq_ref = quintic(q0, np.array(m1_config["q_tilt"]), t, 8.0)
-                tau = scene.diagnostic_pd_tau(q_ref, 20, 8, dq_ref)
-            elif kind == "accel":
-                tau = scene.bias_tau()
-                tau[5] += smooth_pulse(t, 0.3, 0.4, 8.0)
-            elif kind == "lip":
-                q_ref, dq_ref = quintic(np.array(m1_config["q_mouth_out"]), np.array(m1_config["q_mouth_lip"]), t, 8.0)
-                tau = scene.diagnostic_pd_tau(q_ref, 30, 10, dq_ref)
-            else:
-                tau = scene.bias_tau()
-            state = scene.step_physics(tau, hold_driver=True)
-            trial.observe(state)
-            dt_now = float(scene.model.opt.timestep)
-            if kind in ("plate", "spoon"):
-                partner = "plate" if kind == "plate" else "spoon"
-                forces.append(_pair_force(state["contacts"], "food", partner)[0])
-            elif kind in ("tilt", "accel"):
-                forces.append(_pair_force(state["contacts"], "food", "spoon")[0])
-                local = state["tcp_mat"].T @ (state["food_pos"] - state["tcp_pos"])
-                outside = np.linalg.norm(local[:2]) > 0.02 or local[2] > 0.012 or local[2] < -0.004
-                touching = any({c["group1"], c["group2"]} == {"food", "spoon"} for c in state["contacts"])
-                off = off + dt_now if outside and not touching else 0.0
-                if off >= 0.1 and event is None:
-                    event = t
-            else:
-                forces.append(_pair_force(state["contacts"], "spoon", "mouth")[0])
-                if event is None and any("mouth_upper" in (c["geom1"], c["geom2"]) for c in state["contacts"]):
-                    event = t
-            times.append(t)
-            food.append(state["food_pos"].copy())
-        forces = np.asarray(forces)
-        dt = float(scene.model.opt.timestep)
-        window = max(1, int(round(0.2 / dt)))
-        steady = forces[-window:]
-        impulse = np.sum(forces, axis=0) * dt
-        return {
-            "ok": trial.ok,
-            "failure": None if trial.ok else trial.failure["reason"],
-            "steady": np.mean(steady, axis=0),
-            "times": np.asarray(times),
-            "forces": forces,
-            "peak": float(np.max(np.linalg.norm(forces, axis=1))),
-            "impulse": float(np.linalg.norm(impulse)),
-            "event": event,
-            "food": np.mean(np.asarray(food)[-window:], axis=0),
-            "options": scene.effective_options(),
-            "supported": _supported(kind, state),
-        }
-
-    def _supported(kind, state):
-        if kind == "plate":
-            return any({c["group1"], c["group2"]} == {"food", "plate"} for c in state["contacts"])
-        if kind == "spoon":
-            return any({c["group1"], c["group2"]} == {"food", "spoon"} for c in state["contacts"])
-        return True
-
-    durations = {"plate": 1.0, "spoon": 1.0, "accel": 0.85, "lip": 5.5}
-    # Shared by A/B/C. Each seed releases at a different time; the window ends after 100 ms off the spoon and before the plate impact.
-    tilt_seeds = (0, 1, 2, 3, 5)
-    tilt_end = {0: 3.392, 1: 3.47, 2: 3.406, 3: 3.413, 5: 3.453}
-    for seed in tilt_seeds:
-        for kind in ("plate", "spoon", "tilt", "accel", "lip"):
-            run.duration = tilt_end[seed] if kind == "tilt" else durations[kind]
-            row = {"seed": seed, "kind": kind}
-            if kind == "accel":
-                scene.apply_experiment(speed_limit=6.0)
-            for name, cfg in configs.items():
-                tol = None if cfg["tolerance"] is None else base_tol * cfg["tolerance"]
-                settled = kind in ("tilt", "accel")
-                scene.reset(
-                    seed=seed,
-                    preset="food_on_spoon" if kind in ("spoon", "tilt", "accel") else "food_on_plate" if kind == "plate" else "near_mouth",
-                    settle_steps=None if settled else 0,
-                )
-                if kind == "lip":
-                    scene.data.qpos[scene.index.arm_qpos_adr] = np.array(m1_config["q_mouth_out"])
-                    adr = scene.index.food_qpos_adr
-                    scene.data.qpos[adr : adr + 7] = [0.8, 0.35, -0.012, 1, 0, 0, 0]
-                    scene.data.qvel[:] = 0
+    matrix = m1_config["matrix"]
+    seeds = list(matrix["seeds"])
+    kinds = {
+        "plate": float(matrix["plate_duration_s"]),
+        "spoon": float(matrix["spoon_duration_s"]),
+        "tilt": float(matrix["tilt_duration_s"]),
+        "accel": float(matrix["accel_duration_s"]),
+        "lip": float(matrix["lip_duration_s"]),
+    }
+    comparisons = []
+    runs = {}
+    for seed in seeds:
+        for kind, duration in kinds.items():
+            preset = "food_on_spoon" if kind in ("spoon", "tilt", "accel") else "food_on_plate" if kind == "plate" else "near_mouth"
+            scene.reset(seed=seed, preset=preset, settle_steps=None if kind in ("tilt", "accel") else 0)
+            if kind == "lip":
+                scene.data.qpos[scene.index.arm_qpos_adr] = np.array(m1_config["q_mouth_out"])
+                adr = scene.index.food_qpos_adr
+                scene.data.qpos[adr : adr + 7] = [0.8, 0.35, -0.012, 1, 0, 0, 0]
+                scene.data.qvel[:] = 0
+                mujoco.mj_forward(scene.model, scene.data)
+            snap = capture_state(scene)
+            digest = state_digest(scene.data)
+            names = ("A", "B", "C", "D") if kind == "tilt" and seed == 4 else ("A", "B", "C")
+            row = {}
+            for name in names:
+                spec = solvers[name]
                 if kind == "accel":
-                    scene.apply_experiment(timestep=cfg["timestep"], iterations=cfg["iterations"], tolerance=tol, speed_limit=6.0)
+                    scene.apply_experiment(
+                        timestep=spec["timestep"],
+                        iterations=spec["iterations"],
+                        tolerance=base_tol * spec["tolerance_scale"],
+                        speed_limit=float(m1_config["diagnostic_accel"]["speed_limit_rad_s"]),
+                    )
                 else:
-                    scene.apply_experiment(timestep=cfg["timestep"], iterations=cfg["iterations"], tolerance=tol)
-                assert scene.effective_options()["timestep"] == cfg["timestep"]
-                row[name] = run(seed, kind)
-                assert row[name]["ok"], (kind, name, seed, row[name]["failure"])
-            results.append(row)
-
-    def close(a, b, floor, frac):
-        return abs(a - b) <= max(floor, frac * max(abs(a), abs(b)))
-
-    for row in results:
+                    scene.apply_experiment(
+                        timestep=spec["timestep"],
+                        iterations=spec["iterations"],
+                        tolerance=base_tol * spec["tolerance_scale"],
+                    )
+                options = scene.effective_options()
+                assert options["timestep"] == spec["timestep"]
+                assert int(scene.model.opt.iterations) == spec["iterations"]
+                result = run_case(scene, snap, kind, duration)
+                case_id = f"{kind}_seed{seed}_{name}"
+                status = "passed" if result["metrics"]["ok"] else "failed"
+                save_dynamic(
+                    case_id,
+                    result["metrics"],
+                    result["arrays"],
+                    seed=seed,
+                    solver=name,
+                    effective_config=options,
+                    thresholds=THRESHOLDS,
+                    duration_s=duration,
+                    initial_hash=digest,
+                    status=status,
+                    failure_reason=result["metrics"]["failure_reason"],
+                    first_failure_tick=result["metrics"]["first_failure_tick"],
+                )
+                row[name] = result["metrics"]
+                assert result["metrics"]["ok"], (case_id, result["metrics"]["failure_reason"])
+            runs[(kind, seed)] = row
+    for (kind, seed), row in runs.items():
         for other in ("B", "C"):
             ref, cmp_ = row["A"], row[other]
-            if row["kind"] in ("plate", "spoon"):
-                assert ref["supported"] and cmp_["supported"]
-                assert np.linalg.norm(ref["food"] - cmp_["food"]) <= 0.002
-            if row["kind"] in ("tilt", "accel", "lip"):
-                assert ref["event"] is not None and cmp_["event"] is not None, (row["kind"], row["seed"], ref["event"], cmp_["event"])
-                assert abs(ref["event"] - cmp_["event"]) <= 0.02, (row["kind"], row["seed"], ref["event"], cmp_["event"])
-            if row["kind"] in ("tilt", "accel"):
-                t_anchor = min(ref["event"], cmp_["event"])
-                def _before(run):
-                    sel = (run["times"] >= t_anchor - 0.3) & (run["times"] < t_anchor - 0.1)
-                    assert np.any(sel)
-                    return np.mean(run["forces"][sel], axis=0)
-                ref_steady, cmp_steady = _before(ref), _before(cmp_)
-            else:
-                ref_steady, cmp_steady = ref["steady"], cmp_["steady"]
-            assert close(np.linalg.norm(ref_steady), np.linalg.norm(cmp_steady), 0.001, 0.1), (
-                row["kind"], row["seed"], other, np.linalg.norm(ref_steady), np.linalg.norm(cmp_steady)
-            )
-            assert close(ref["peak"], cmp_["peak"], 0.02, 0.1), (row["kind"], row["seed"], other, ref["peak"], cmp_["peak"])
-            assert close(ref["impulse"], cmp_["impulse"], 1e-4, 0.1), (row["kind"], row["seed"], other, ref["impulse"], cmp_["impulse"])
+            if kind in ("tilt", "accel", "lip"):
+                assert ref["event_s"] is not None and cmp_["event_s"] is not None, (kind, seed, ref["event_s"], cmp_["event_s"])
+                assert abs(ref["event_s"] - cmp_["event_s"]) <= 0.02, (kind, seed, other, ref["event_s"], cmp_["event_s"])
+            if kind in ("plate", "spoon"):
+                assert np.linalg.norm(np.array(ref["steady_food_pos_m"]) - np.array(cmp_["steady_food_pos_m"])) <= 0.002
+            steady_ok = _close(np.linalg.norm(ref["steady_force_n"]), np.linalg.norm(cmp_["steady_force_n"]), 0.001, 0.1)
+            peak_ok = _close(ref["peak_force_n"], cmp_["peak_force_n"], 0.02, 0.1)
+            vec_ok = _close(np.linalg.norm(ref["vector_impulse_ns"]), np.linalg.norm(cmp_["vector_impulse_ns"]), 1e-4, 0.1)
+            sca_ok = _close(ref["scalar_impulse_ns"], cmp_["scalar_impulse_ns"], 1e-4, 0.1)
+            comparisons.append(_comparison(kind, seed, f"A/{other}", ref, cmp_, steady_ok, peak_ok, vec_ok, sca_ok))
+            assert steady_ok and peak_ok and vec_ok and sca_ok, comparisons[-1]
+        if kind == "tilt" and seed == 4:
+            for left, right in (("B", "D"), ("A", "D")):
+                ref, cmp_ = row[left], row[right]
+                assert abs(ref["event_s"] - cmp_["event_s"]) <= 0.02, (left, right, ref["event_s"], cmp_["event_s"])
+                steady_ok = _close(np.linalg.norm(ref["steady_force_n"]), np.linalg.norm(cmp_["steady_force_n"]), 0.001, 0.1)
+                peak_ok = _close(ref["peak_force_n"], cmp_["peak_force_n"], 0.02, 0.1)
+                vec_ok = _close(np.linalg.norm(ref["vector_impulse_ns"]), np.linalg.norm(cmp_["vector_impulse_ns"]), 1e-4, 0.1)
+                sca_ok = _close(ref["scalar_impulse_ns"], cmp_["scalar_impulse_ns"], 1e-4, 0.1)
+                comparisons.append(_comparison(kind, seed, f"{left}/{right}", ref, cmp_, steady_ok, peak_ok, vec_ok, sca_ok))
+                assert steady_ok and peak_ok and vec_ok and sca_ok, comparisons[-1]
+    run_dir = os.environ.get("M1_RUN_DIR")
+    if run_dir:
+        Path(run_dir, "comparisons.json").write_text(json.dumps(comparisons, indent=2))
     save_case(
         "T13_T14",
-        {"n_rows": len(results)},
-        seeds=list(tilt_seeds),
-        log={"n_rows": np.array([len(results)])},
+        {"n_formal_runs": 6 * 5 * 3, "n_seed4_d": 1},
+        seeds=seeds,
+        thresholds=THRESHOLDS,
+        effective_config={"seeds": seeds, "durations_s": kinds},
+        duration_s=max(kinds.values()),
+        log={"n_formal_runs": np.array([90])},
     )
+
+

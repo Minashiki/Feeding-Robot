@@ -9,13 +9,31 @@
   "velocity_soft_limit_rad_s": 0.5,
   "tilt": {"duration_s": 8.0, "kp": 20.0, "kd": 8.0},
   "mouth_move": {"duration_s": 3.0, "kp": 30.0, "kd": 10.0},
+  "spoon_support": {
+    "frame": "tcp",
+    "half_xy_m": 0.02,
+    "z_min_m": -0.004,
+    "z_max_m": 0.012,
+    "confirm_s": 0.1
+  },
+  "matrix": {
+    "seeds": [0, 1, 2, 3, 4, 5],
+    "plate_duration_s": 1.0,
+    "spoon_duration_s": 1.0,
+    "tilt_duration_s": 3.8,
+    "accel_duration_s": 0.85,
+    "lip_duration_s": 6.4,
+    "lip_move_s": 8.0
+  },
   "diagnostic_accel": {
     "speed_limit_rad_s": 6.0,
     "joint": 5,
     "amplitude_nm": 8.0,
     "start_s": 0.3,
     "duration_s": 0.4,
-    "reason": "Friction 0.5 needs lateral acceleration above about 4.9 m/s^2 to slide the 12 mm cube out of the 8 mm bowl without using the slow tilt. A smooth joint-6 pulse that does this peaks near 5.4 rad/s, so this case has its own 6 rad/s limit. Carry, tilt, and mouth tests stay at 0.5 rad/s."
+    "candidates_nm": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0],
+    "tcp_accel": "finite difference of mj_jacSite linear velocity over the actual timestep",
+    "reason": "On the current spoon (sliding friction 0.15, side walls shortened so they no longer meet the front lip), smooth joint-6 pulses of 1 to 6 N m did not keep the cube off the spoon for 0.1 s within 1.6 s. 8 N m did, at seed 0, with peak joint speed 5.41 rad/s and peak TCP acceleration about 63 m/s^2. The case limit is 6 rad/s, a round value at least 10 percent above that peak. Carry, tilt, and mouth tests stay at 0.5 rad/s. This limit is not an M2 operating speed."
   },
   "hold_recovery": {
     "force_n": [0.0, 0.0, 6.0],
