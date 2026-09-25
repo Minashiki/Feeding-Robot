@@ -46,6 +46,8 @@ class ReferenceShaper:
         self.blocked = False
         self.reanchored = False
         self.clipped_offset = np.zeros(3)
+        self.constraint_reset = None
+        self._sat_time = 0.0
 
     def anchor_pose(self, pos: np.ndarray, rot: np.ndarray, q: np.ndarray) -> None:
         self.p_ref = np.asarray(pos, dtype=float).copy()
@@ -60,6 +62,7 @@ class ReferenceShaper:
         self.blocked = False
         self.reanchored = False
         self.clipped_offset[:] = 0
+        self.constraint_reset = None
 
     def reanchor(self, pos: np.ndarray, rot: np.ndarray) -> None:
         jump = np.asarray(pos, dtype=float) - self.p_ref
@@ -71,6 +74,31 @@ class ReferenceShaper:
         self.reanchored = True
         self._block_time = 0.0
         self._dev_time = 0.0
+
+    def _project_history(self, limits: dict) -> str | None:
+        reason = None
+        if float(np.linalg.norm(self.v_lin)) > float(limits["v"]) + 1e-12:
+            self.v_lin = _limit_norm(self.v_lin, float(limits["v"]))
+            reason = "linear_speed"
+        if float(np.linalg.norm(self.v_ang)) > float(limits["w"]) + 1e-12:
+            self.v_ang = _limit_norm(self.v_ang, float(limits["w"]))
+            reason = "angular_speed" if reason is None else reason + "+angular_speed"
+        return reason
+
+    def _pack(self, lin, ang, scale: float, blocked_now: bool) -> dict:
+        return {
+            "twist_limited": np.concatenate([np.asarray(lin, dtype=float).reshape(3), np.asarray(ang, dtype=float).reshape(3)]),
+            "p_ref": None if self.p_ref is None else self.p_ref.copy(),
+            "r_ref": None if self.r_ref is None else self.r_ref.copy(),
+            "v_ref": np.zeros(6),
+            "blocked": self.blocked,
+            "blocked_now": blocked_now,
+            "reanchored": self.reanchored,
+            "clipped_offset": self.clipped_offset.copy(),
+            "scale": float(scale),
+            "constraint_reset": self.constraint_reset,
+            "v_hist": np.concatenate([self.v_lin, self.v_ang]),
+        }
 
     def shape(
         self,
@@ -84,17 +112,43 @@ class ReferenceShaper:
         joint_scale: float,
         active: bool,
         saturated: bool,
+        execution: str = "run",
     ) -> dict:
-        """Integrate one step. `active` is false during faults, power-on, and expired commands."""
+        """Integrate one step.
+
+        `execution` separates a normal zero command from a hard stop.
+        A tighter speed bound projects the stored reference velocity first.
+        """
         self.reanchored = False
+        self.constraint_reset = None
         twist = np.asarray(twist, dtype=float).reshape(6)
+        if execution in {"power_on", "stop", "prohibit"} or (not active and execution != "zero"):
+            self.v_lin[:] = 0.0
+            self.v_ang[:] = 0.0
+            if execution == "prohibit":
+                self.constraint_reset = "prohibit"
+            return self._pack(np.zeros(3), np.zeros(3), 0.0, False)
+        if saturated:
+            self.v_lin[:] = 0.0
+            self.v_ang[:] = 0.0
+            self.constraint_reset = "saturation_pause"
+            return self._pack(np.zeros(3), np.zeros(3), 0.0, False)
         if not active:
             twist = np.zeros(6)
+            execution = "zero"
         scale = float(np.clip(scale, 0.0, 1.0)) * float(np.clip(joint_scale, 0.0, 1.0))
+        if scale <= 0.0:
+            self.v_lin[:] = 0.0
+            self.v_ang[:] = 0.0
+            self.constraint_reset = "prohibit"
+            return self._pack(np.zeros(3), np.zeros(3), 0.0, False)
+        self.constraint_reset = self._project_history(limits)
         lin = _limit_norm(twist[:3], limits["v"]) * scale
         ang = _limit_norm(twist[3:], limits["w"]) * scale
         lin = _accel_limit(self.v_lin, lin, limits["a"], dt)
         ang = _accel_limit(self.v_ang, ang, limits["alpha"], dt)
+        lin = _limit_norm(lin, limits["v"])
+        ang = _limit_norm(ang, limits["w"])
         lin, ang, blocked_now = self._suppress(lin, ang, pos, rot, force, dt, limits, saturated, active)
         self.v_lin = lin
         self.v_ang = ang
@@ -127,6 +181,8 @@ class ReferenceShaper:
             "reanchored": self.reanchored,
             "clipped_offset": self.clipped_offset.copy(),
             "scale": scale,
+            "constraint_reset": self.constraint_reset,
+            "v_hist": np.concatenate([self.v_lin, self.v_ang]),
         }
 
     def _suppress(self, lin, ang, pos, rot, force, dt, limits, saturated, active):

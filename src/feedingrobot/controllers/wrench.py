@@ -16,25 +16,22 @@ def _principal_world(model, data, body_id: int) -> np.ndarray:
 
 
 def body_spatial(model, data, body_id: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """World angular velocity, COM linear velocity, angular acc, COM linear acc.
+    """COM twist and coordinate acceleration for one body.
 
-    mj_objectAcceleration returns classical rot:lin of the body frame. The COM
-    acceleration adds the rigid offset from that frame origin.
+    On MuJoCo 3.14.0, mj_objectVelocity/Acceleration for mjOBJ_BODY already
+    report the center of mass. The linear acceleration uses the specific-force
+    convention, so gravity is added to obtain coordinate acceleration.
     """
+    if hasattr(mujoco, "mj_rnePostConstraint"):
+        mujoco.mj_rnePostConstraint(model, data)
     vel = np.zeros(6)
     acc = np.zeros(6)
     mujoco.mj_objectVelocity(model, data, int(mujoco.mjtObj.mjOBJ_BODY), int(body_id), vel, 0)
     mujoco.mj_objectAcceleration(model, data, int(mujoco.mjtObj.mjOBJ_BODY), int(body_id), acc, 0)
     omega = vel[:3].copy()
-    origin = np.array(data.xpos[body_id], dtype=float)
-    com = np.array(data.xipos[body_id], dtype=float)
-    offset = com - origin
+    v_com = vel[3:].copy()
     alpha = acc[:3].copy()
-    # At rest this binding returns +9.81 m/s^2 upward, i.e. specific force.
-    # Coordinate acceleration is that reading plus gravity (0 when the body is still).
-    a_origin = acc[3:].copy() + np.array(model.opt.gravity, dtype=float)
-    a_com = a_origin + np.cross(alpha, offset) + np.cross(omega, np.cross(omega, offset))
-    v_com = vel[3:].copy() + np.cross(omega, offset)
+    a_com = acc[3:].copy() + np.array(model.opt.gravity, dtype=float)
     return omega, v_com, alpha, a_com
 
 
@@ -82,12 +79,15 @@ class WrenchPipeline:
         self.bias_ready = False
         self._bias_buf: list[np.ndarray] = []
         self._stable = 0.0
+        self.generation = 0
         self.reset()
 
     def reset(self) -> None:
+        self.generation += 1
         self.filtered = np.zeros(6)
         self.filter_ready = False
         self._filter_time = 0.0
+        self.filter_updates = 0
         self._buffer: deque[tuple[float, np.ndarray]] = deque()
         self.rng = np.random.default_rng(self.seed)
         self._prev_com = None
@@ -99,6 +99,76 @@ class WrenchPipeline:
         self.bias_ready = False
         self._bias_buf = []
         self._stable = 0.0
+        self._cache_key = None
+        self._cache = None
+
+    def measure(self, model, data, raw, rot_ws, p_site, p_tcp, sign: float) -> dict:
+        """Pure compensation. Does not touch the filter, noise, or delay queue."""
+        from feedingrobot.sim.sensors import world_and_tcp_wrench
+
+        wrench_w, wrench_tcp = world_and_tcp_wrench(raw, rot_ws, p_site, p_tcp, sign)
+        predicted = predict_tool_wrench(model, data, self.body_ids, p_tcp)
+        bias_f, bias_m = rotate_wrench(self.bias_sensor[:3], self.bias_sensor[3:], rot_ws, sign)
+        bias_tcp = np.concatenate([bias_f, shift_torque(bias_m, bias_f, p_site, p_tcp)])
+        compensated = wrench_tcp - predicted - bias_tcp
+        return {
+            "raw_wrench_sensor": np.asarray(raw, dtype=float).copy(),
+            "wrench_world_at_ft": wrench_w.copy(),
+            "tcp_wrench_world": wrench_tcp.copy(),
+            "tool_load_predicted": predicted.copy(),
+            "compensated_wrench_tcp": compensated.copy(),
+            "exact_model": compensated.copy(),
+            "finite": bool(np.all(np.isfinite(compensated))),
+        }
+
+    def update_sample(self, measurement: dict, tick: int, sample_time: float, dt: float) -> dict:
+        """Advance the observation path once for a new (generation, tick, time)."""
+        key = (int(self.generation), int(tick), float(sample_time))
+        if key == self._cache_key:
+            return self._cache
+        compensated = np.asarray(measurement["compensated_wrench_tcp"], dtype=float)
+        if self.filter_updates == 0:
+            self.filtered = compensated.copy()
+        else:
+            alpha = 1.0 - np.exp(-2.0 * np.pi * self.fc * float(dt))
+            self.filtered = self.filtered + alpha * (compensated - self.filtered)
+            self._filter_time += float(dt)
+        self.filter_updates += 1
+        self.filter_ready = self.filter_updates > 1 and self._filter_time >= 1.0 / max(self.fc, 1e-6)
+        observed = self.filtered.copy()
+        if self.noise_on and self.filter_ready:
+            observed[:3] += self.rng.normal(0.0, self.force_std, size=3)
+            observed[3:] += self.rng.normal(0.0, self.torque_std, size=3)
+        self._buffer.append((float(sample_time), observed.copy()))
+        deliver_t = float(sample_time) - self.delay_s
+        delivered = None
+        sample_t = None
+        while self._buffer and self._buffer[0][0] <= deliver_t + 1e-12:
+            sample_t, delivered = self._buffer.popleft()
+        valid = delivered is not None and self.filter_ready and bool(measurement["finite"])
+        if delivered is None:
+            delivered = np.full(6, np.nan)
+            age = None
+        else:
+            age = float(sample_time) - float(sample_t)
+        result = {
+            **measurement,
+            "filtered_wrench_tcp": self.filtered.copy(),
+            "delivered_wrench_tcp": np.asarray(delivered, dtype=float).copy(),
+            "sample_time": float(sample_time),
+            "sample_tick": int(tick),
+            "deliver_time": float(sample_time) if valid else None,
+            "age_s": age,
+            "valid": bool(valid),
+            "warmup": not self.filter_ready,
+            "bias_ready": self.bias_ready,
+            "filter_updates": int(self.filter_updates),
+            "estimated_valid": False,
+            "estimated_kinematics": np.full(6, np.nan),
+        }
+        self._cache_key = key
+        self._cache = result
+        return result
 
     def _estimated(self, data, p_tcp: np.ndarray, t: float) -> np.ndarray:
         """Causal COM finite difference. Inertia terms stay on the exact-model path."""
@@ -129,71 +199,10 @@ class WrenchPipeline:
         del key
         return np.concatenate([force, moment])
 
-    def update(self, model, data, raw: np.ndarray, rot_ws: np.ndarray, p_site: np.ndarray, p_tcp: np.ndarray, sign: float, t: float, dt: float, calibrate: bool, stable: bool) -> dict:
-        from feedingrobot.sim.sensors import world_and_tcp_wrench
-
-        wrench_w, wrench_tcp = world_and_tcp_wrench(raw, rot_ws, p_site, p_tcp, sign)
-        predicted = predict_tool_wrench(model, data, self.body_ids, p_tcp)
-        estimated = self._estimated(data, p_tcp, t)
-        if calibrate and not self.bias_ready:
-            if stable:
-                self._stable += dt
-                if self._stable >= 0.5:
-                    self._bias_buf.append(np.asarray(raw, dtype=float).copy())
-                    if self._stable >= 1.5:
-                        mean_raw = np.mean(self._bias_buf, axis=0)
-                        # Residual in the sensor frame after removing the known tool load.
-                        load_s_force = rot_ws.T @ predicted[:3] / sign if sign != 0 else predicted[:3]
-                        # raw maps by sign*R, so sensor residual = raw - R.T @ (sign-inverse of predicted).
-                        pred_sensor_f = rot_ws.T @ (predicted[:3] / sign)
-                        pred_sensor_m = rot_ws.T @ (predicted[3:] / sign)
-                        self.bias_sensor = mean_raw - np.concatenate([pred_sensor_f, pred_sensor_m])
-                        self.bias_ready = True
-            else:
-                self._stable = 0.0
-                self._bias_buf = []
-        bias_f, bias_m = rotate_wrench(self.bias_sensor[:3], self.bias_sensor[3:], rot_ws, sign)
-        bias_tcp_m = shift_torque(bias_m, bias_f, p_site, p_tcp)
-        bias_tcp = np.concatenate([bias_f, bias_tcp_m])
-        compensated = wrench_tcp - predicted - bias_tcp
-        alpha = 1.0 - np.exp(-2.0 * np.pi * self.fc * dt)
-        self.filtered = self.filtered + alpha * (compensated - self.filtered)
-        self._filter_time += dt
-        self.filter_ready = self._filter_time >= 1.0 / max(self.fc, 1e-6)
-        observed = self.filtered.copy()
-        if self.noise_on and self.filter_ready:
-            observed[:3] += self.rng.normal(0.0, self.force_std, size=3)
-            observed[3:] += self.rng.normal(0.0, self.torque_std, size=3)
-        self._buffer.append((t, observed.copy()))
-        deliver_t = t - self.delay_s
-        delivered = None
-        sample_t = None
-        while self._buffer and self._buffer[0][0] <= deliver_t + 1e-12:
-            sample_t, delivered = self._buffer.popleft()
-        valid = delivered is not None and self.filter_ready
-        if delivered is None:
-            delivered = np.full(6, np.nan)
-            age = np.nan
-        else:
-            age = t - sample_t
-        finite = bool(np.all(np.isfinite(compensated)))
-        return {
-            "raw_wrench_sensor": np.asarray(raw, dtype=float).copy(),
-            "wrench_world_at_ft": wrench_w.copy(),
-            "tcp_wrench_world": wrench_tcp.copy(),
-            "tool_load_predicted": predicted.copy(),
-            "compensated_wrench_tcp": compensated.copy(),
-            "filtered_wrench_tcp": self.filtered.copy(),
-            "delivered_wrench_tcp": np.asarray(delivered, dtype=float).copy(),
-            "sample_time": None if sample_t is None else float(sample_t),
-            "deliver_time": float(t) if valid else None,
-            "age_s": None if sample_t is None else float(age),
-            "valid": bool(valid and finite),
-            "warmup": not self.filter_ready,
-            "bias_ready": self.bias_ready,
-            "exact_model": compensated.copy(),
-            "estimated_kinematics": (wrench_tcp - estimated - bias_tcp).copy(),
-        }
+    def update(self, model, data, raw, rot_ws, p_site, p_tcp, sign: float, t: float, dt: float, calibrate: bool = False, stable: bool = False) -> dict:
+        del calibrate, stable
+        measured = self.measure(model, data, raw, rot_ws, p_site, p_tcp, sign)
+        return self.update_sample(measured, tick=0, sample_time=float(t), dt=float(dt))
 
 
 def so3_omega(rot: np.ndarray, prev: np.ndarray, dt: float) -> np.ndarray:

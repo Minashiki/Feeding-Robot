@@ -10,7 +10,9 @@ next_state = scene.step_physics(tau_arm)
 guard.observe(next_state, info["phase_k"], info)
 ```
 
-`twist_world` 是世界系六维速度，前三维平移（m/s），后三维角速度（rad/s）。`command_time` 不能晚于当前回合时间，未知阶段会被拒绝。命令默认每 50 ms 发布一次，有效期 100 ms。过期会锁存 `command_expired`，重复命令不会清除已有故障。
+`twist_world` 是世界系六维速度，前三维平移（m/s），后三维角速度（rad/s）。命令时间用场景回合时钟，不用墙钟，也不用可能落后一步的缓存。`command_time <= now < valid_until`，有效期最长 0.1 s。NaN 或 Inf 会取消命令并进入 `ABORTED`。相同时间戳只接受内容完全一致的重传，不能改 twist、阶段或截止时间。`now == valid_until` 时命令已经过期，当前控制区间直接走停止分支。
+
+保护力是步后样本 `S_{k+1}` 的未滤波补偿力。`compute` 只用上一份已缓存的测量，不在同一次计算里再推进滤波器。
 
 阶段 `SELECT` / `TRANSPORT` / `WAIT_READY` 用 FREE 档，`ACQUIRE` 用取餐档，`APPROACH` / `TRANSFER` / `RETRACT` 用 MOUTH 档。更严的速度和偏差限制在切换时立即生效，刚度在 0.2 s 内插值。
 

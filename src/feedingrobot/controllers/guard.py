@@ -115,7 +115,7 @@ class Guard:
         elif self.status == "RUNNING":
             self.status = "STOPPING"
 
-    def observe(self, state: dict, phase: str, control_info: dict | None = None) -> None:
+    def observe(self, state: dict, phase: str, control_info: dict | None = None, measurement: dict | None = None) -> None:
         self.phase = phase
         info = control_info or {}
         if self.status == "ABORTED":
@@ -164,10 +164,8 @@ class Guard:
                     if reason is None and info.get("observation_invalid"):
                         reason = "observation_invalid"
                     if reason is None:
-                        wrench = state.get("guard_wrench")
-                        if wrench is None:
-                            wrench = info.get("guard_wrench")
-                        gear = info.get("gear") or (gear_of(phase) if phase in GEAR_OF else "FREE")
+                        wrench = None if measurement is None else measurement.get("compensated_wrench_tcp")
+                        gear = info.get("wrench_gear") or (gear_of(phase) if phase in GEAR_OF else "FREE")
                         if wrench is not None and gear in self.wrench_limits:
                             force_lim, moment_lim = self.wrench_limits[gear]
                             force = float(np.linalg.norm(np.asarray(wrench[:3], dtype=float)))

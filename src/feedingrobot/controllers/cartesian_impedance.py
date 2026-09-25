@@ -85,15 +85,27 @@ class CartesianImpedance:
         self.power_time = 0.0
         self.takeover_failed = False
         self.phase = "TRANSPORT"
+        self.active_gear = "FREE"
+        self.target_gear = "FREE"
         self._gear_now = "FREE"
         self._gear_next = "FREE"
         self._blend = 1.0
+        self.transition_elapsed = float(self.blend_s)
         self._k = self._vector_gain("FREE")
         self._d = self._vector_damp("FREE")
+        self.k_start = self._k.copy()
+        self.d_start = self._d.copy()
+        self.limits_start = self._limits("FREE")
         self.sim_time = 0.0
         self._command = None
+        self._last_stamp = None
         self._sat_time = 0.0
+        self._sat_union = 0.0
+        self._pause_advance = False
+        self._last_tau_raw = np.zeros(_ARM)
+        self._tau_before = np.zeros(_ARM)
         self._stop_anchored = False
+        self.command_max_valid = float(self.config.get("command_valid_max_s", 0.1))
 
     def reset(self, state: dict, tau_applied, phase: str = "TRANSPORT") -> None:
         if phase not in PHASES:
@@ -104,50 +116,89 @@ class CartesianImpedance:
         self.reference.anchor_pose(state["tcp_pos"], state["tcp_mat"], state["q"])
         self.tau_prev = np.asarray(tau_applied, dtype=float).reshape(_ARM).copy()
         self.phase = phase
-        self._gear_now = gear_of(phase)
-        self._gear_next = self._gear_now
-        self._k = self._vector_gain(self._gear_now)
-        self._d = self._vector_damp(self._gear_now)
+        self.active_gear = gear_of(phase)
+        self.target_gear = self.active_gear
+        self._gear_now = self.active_gear
+        self._gear_next = self.active_gear
+        self._k = self._vector_gain(self.active_gear)
+        self._d = self._vector_damp(self.active_gear)
+        self.k_start = self._k.copy()
+        self.d_start = self._d.copy()
+        self.limits_start = self._limits(self.active_gear)
+        self.transition_elapsed = float(self.blend_s)
         self.sim_time = float(state.get("episode_time", 0.0))
         if self.guard is not None:
             self.guard.reset()
+        self._seed_wrench(state)
+
+    def now(self) -> float:
+        return float(self.data.time - self.scene.time_offset)
+
+    def _abort_input(self, reason: str, when: float) -> None:
+        self._command = None
+        if self.guard is None:
+            return
+        self.guard.latch(
+            {
+                "tick": int(self.scene.tick),
+                "time": float(when) if np.isfinite(when) else self.now(),
+                "reason": "non-finite",
+                "phase": self.phase,
+                "pair": None,
+                "geoms": None,
+                "measured": reason,
+                "limit": None,
+            }
+        )
+        self.guard.status = "ABORTED"
 
     def set_command(self, twist_world, command_time: float, valid_until: float, phase: str, frame: str = "world") -> dict:
-        twist = np.asarray(twist_world, dtype=float).reshape(6)
+        twist = np.asarray(twist_world, dtype=float).reshape(-1)
+        now = self.now()
         rejected = None
-        if frame != "world":
+        if twist.shape != (6,) or not np.all(np.isfinite(twist)):
+            rejected = "non-finite-command"
+        elif not np.isfinite(command_time) or not np.isfinite(valid_until):
+            rejected = "non-finite-time"
+        elif frame != "world":
             rejected = "frame"
         elif phase not in PHASES:
             rejected = "phase"
-        elif not np.all(np.isfinite(twist)):
-            rejected = "non-finite-command"
-            if self.guard is not None:
-                self.guard.latch(
-                    {
-                        "tick": int(self.scene.tick),
-                        "time": float(command_time),
-                        "reason": "non-finite",
-                        "phase": self.phase,
-                        "pair": None,
-                        "geoms": None,
-                        "measured": None,
-                        "limit": None,
-                    }
-                )
-                self.guard.status = "ABORTED"
-        elif float(command_time) > self.sim_time + 1e-9:
+        elif float(command_time) > now + 1e-12:
             rejected = "future"
+        elif not (float(valid_until) > float(command_time) + 1e-12):
+            rejected = "invalid-horizon"
+        elif float(valid_until) - float(command_time) > self.command_max_valid + 1e-12:
+            rejected = "horizon-too-long"
+        elif float(valid_until) <= now + 1e-12:
+            rejected = "already-expired"
+        if rejected in {"non-finite-command", "non-finite-time"}:
+            self._abort_input(rejected, now)
+            return {"accepted": False, "rejected": rejected}
         fault = self.guard.failure if self.guard is not None else None
-        if rejected is None and fault is None:
-            self._command = {
-                "twist": twist.copy(),
-                "command_time": float(command_time),
-                "valid_until": float(valid_until),
-                "phase": phase,
-                "frame": frame,
-            }
-            self.phase = phase
-        return {"accepted": rejected is None and fault is None, "rejected": rejected}
+        if fault is not None:
+            return {"accepted": False, "rejected": "fault"}
+        if rejected is not None:
+            return {"accepted": False, "rejected": rejected}
+        stamp = float(command_time)
+        payload = {
+            "twist": twist.copy(),
+            "command_time": stamp,
+            "valid_until": float(valid_until),
+            "phase": phase,
+            "frame": frame,
+        }
+        if self._last_stamp is not None and stamp < self._last_stamp - 1e-12:
+            return {"accepted": False, "rejected": "stale"}
+        if self._last_stamp is not None and abs(stamp - self._last_stamp) <= 1e-12:
+            same = self._command is not None and self._command["phase"] == phase and abs(self._command["valid_until"] - payload["valid_until"]) <= 1e-12 and np.allclose(self._command["twist"], twist)
+            if same:
+                return {"accepted": True, "rejected": None, "idempotent": True}
+            return {"accepted": False, "rejected": "conflict"}
+        self._command = payload
+        self._last_stamp = stamp
+        self.phase = phase
+        return {"accepted": True, "rejected": None, "idempotent": False}
 
     def _vector_gain(self, gear: str) -> np.ndarray:
         spec = self.gears[gear]
@@ -175,30 +226,47 @@ class CartesianImpedance:
 
     def _update_gains(self, dt: float) -> None:
         target = gear_of(self.phase) if self.phase in GEAR_OF else "STOP"
-        if target != self._gear_next:
-            if target in {"STOP", "RECOVER"}:
-                self._gear_now = "STOP"
-                self._gear_next = "STOP"
-                self._blend = 1.0
-            else:
-                self._gear_now = self._gear_next if self._blend >= 1.0 else self._gear_now
-                self._gear_next = target
-                self._blend = 0.0
-                new_limits = self._limits(target)
-                err = self.reference.p_ref - self._tcp_pos
-                if float(np.linalg.norm(err)) > new_limits["pos_dev"] or float(np.linalg.norm(orientation_error(self.reference.r_ref, self._tcp_rot))) > new_limits["rot_dev"]:
-                    self.reference.reanchor(self._tcp_pos, self._tcp_rot)
-        if self._gear_next == "STOP":
+        if target in {"STOP"} or self.phase in {"STOP", "RECOVER"}:
+            self.active_gear = "STOP"
+            self.target_gear = "STOP"
             self._k = np.zeros(6)
-            self._d = self._vector_damp("FREE") * 0.0
+            self._d = np.zeros(6)
+            self._blend = 1.0
+            self.transition_elapsed = self.blend_s
             return
-        self._blend = min(1.0, self._blend + dt / self.blend_s)
-        k0 = self._vector_gain(self._gear_now)
-        k1 = self._vector_gain(self._gear_next)
-        d0 = self._vector_damp(self._gear_now)
-        d1 = self._vector_damp(self._gear_next)
-        self._k = (1.0 - self._blend) * k0 + self._blend * k1
-        self._d = (1.0 - self._blend) * d0 + self._blend * d1
+        if target != self.target_gear:
+            self.k_start = self._k.copy()
+            self.d_start = self._d.copy()
+            self.limits_start = self.effective_limits()
+            self.target_gear = target
+            self.transition_elapsed = 0.0
+            new_limits = self._limits(target)
+            err = self.reference.p_ref - self._tcp_pos
+            ori = float(np.linalg.norm(orientation_error(self.reference.r_ref, self._tcp_rot)))
+            if float(np.linalg.norm(err)) > new_limits["pos_dev"] or ori > new_limits["rot_dev"]:
+                self.reference.reanchor(self._tcp_pos, self._tcp_rot)
+        if self.target_gear != self.active_gear:
+            self.transition_elapsed = min(self.blend_s, self.transition_elapsed + dt)
+            span = max(self.blend_s, 1e-9)
+            mix = min(self.transition_elapsed / span, 1.0)
+            self._k = (1.0 - mix) * self.k_start + mix * self._vector_gain(self.target_gear)
+            self._d = (1.0 - mix) * self.d_start + mix * self._vector_damp(self.target_gear)
+            self._blend = mix
+            if mix >= 1.0 - 1e-15:
+                self.active_gear = self.target_gear
+                self.limits_start = self._limits(self.active_gear)
+        else:
+            self._k = self._vector_gain(self.active_gear)
+            self._d = self._vector_damp(self.active_gear)
+            self._blend = 1.0
+        self._gear_now = self.active_gear
+        self._gear_next = self.target_gear
+
+    def effective_limits(self) -> dict:
+        if self.target_gear == self.active_gear or self.target_gear not in self.gears:
+            gear = self.active_gear if self.active_gear in self.gears else "FREE"
+            return self._limits(gear)
+        return {key: min(self.limits_start[key], self._limits(self.target_gear)[key]) for key in self.limits_start}
 
     def _jacobian(self) -> tuple[np.ndarray, np.ndarray]:
         jacp = np.zeros((3, self.model.nv))
@@ -267,25 +335,45 @@ class CartesianImpedance:
         active_cmd = self._command
         expired = False
         twist = np.zeros(6)
-        if active_cmd is not None:
-            if self.sim_time > active_cmd["valid_until"] + 1e-12:
-                expired = not self.power_on
-            else:
-                twist = active_cmd["twist"].copy()
-                if active_cmd["phase"] != self.phase and self.guard is not None and self.guard.failure is None:
-                    self.phase = active_cmd["phase"]
+        if active_cmd is not None and (not self.power_on) and self.sim_time >= active_cmd["valid_until"] - 1e-12:
+            expired = True
+            self._command = None
+            if self.guard is not None and self.guard.failure is None:
+                self.guard.latch(
+                    {
+                        "tick": int(state["tick"]),
+                        "time": self.sim_time,
+                        "reason": "command_expired",
+                        "phase": self.phase,
+                        "pair": None,
+                        "geoms": None,
+                        "measured": self.sim_time,
+                        "limit": active_cmd["valid_until"],
+                    }
+                )
+            stopping = True
+        elif active_cmd is not None and self.sim_time < active_cmd["valid_until"] - 1e-12:
+            twist = active_cmd["twist"].copy()
         if self.power_on or stopping or (self.guard is not None and self.guard.failure is not None):
             twist = np.zeros(6)
         self._update_gains(dt)
-        limit_gear = self._gear_next if self._gear_next in self.gears else "FREE"
-        other = self._gear_now if self._gear_now in self.gears else limit_gear
-        limits = self._strict_limits(limit_gear, other) if not stopping else self._limits("MOUTH")
+        limits = self.effective_limits()
         if stopping:
             for key in ("v", "w", "a", "alpha"):
                 limits[key] = 0.0
+        if self.power_on:
+            execution = "power_on"
+        elif stopping or expired:
+            execution = "stop"
+        elif cmd_scale <= 0.0:
+            execution = "prohibit"
+        elif float(np.linalg.norm(twist)) == 0.0:
+            execution = "zero"
+        else:
+            execution = "run"
         joint_scale = 0.0 if cmd_scale <= 0 else self._joint_scale(jbar, twist, q)
-        wrench_info = self._sense(state, dt)
-        force = np.asarray(wrench_info["compensated_wrench_tcp"][:3], dtype=float)
+        cached = self.wrench._cache
+        force = np.zeros(3) if cached is None else np.asarray(cached["compensated_wrench_tcp"][:3], dtype=float)
         shaped = self.reference.shape(
             twist,
             self._tcp_pos,
@@ -295,8 +383,9 @@ class CartesianImpedance:
             limits,
             cmd_scale,
             joint_scale,
-            active=not (self.power_on or stopping or expired or cmd_scale <= 0),
-            saturated=False,
+            active=execution in {"run", "zero"},
+            saturated=bool(self._pause_advance) and not self.power_on,
+            execution=execution,
         )
         e = np.concatenate(
             [
@@ -325,13 +414,10 @@ class CartesianImpedance:
         else:
             tau_task = jacobian.T @ wrench_c
             tau_raw = tau_task + bias + null_term
-        tau_cmd = clip_torque(tau_raw, self.tau_prev, self.tau_max, self.rate, dt)
-        magnitude_sat = bool(np.any(np.abs(tau_raw) > self.tau_max + 1e-8))
-        if magnitude_sat:
-            self._sat_time += dt
-        else:
-            self._sat_time = 0.0
-        self.tau_prev = tau_cmd.copy()
+        tau_before = self.tau_prev.copy()
+        tau_cmd = clip_torque(tau_raw, tau_before, self.tau_max, self.rate, dt)
+        self._last_tau_raw = tau_raw.copy()
+        self._tau_before = tau_before
         if self.power_on:
             self.power_time += dt
             err = float(np.linalg.norm(self.reference.p_ref - self._tcp_pos))
@@ -359,7 +445,9 @@ class CartesianImpedance:
         info = {
             "apply": True,
             "phase_k": self.phase,
-            "gear": "STOP" if stopping else (self._gear_next if self._blend > 0 else self._gear_now),
+            "gear": "STOP" if stopping else self.target_gear,
+            "wrench_gear": "STOP" if stopping else (gear_of(self.phase) if self.phase in GEAR_OF else "FREE"),
+            "control_mode": "POWER_ON" if self.power_on else ("STOPPING" if stopping else "RUNNING"),
             "status": "POWER_ON" if self.power_on else (self.guard.status if self.guard is not None else "RUNNING"),
             "q": q.copy(),
             "dq": dq.copy(),
@@ -385,16 +473,65 @@ class CartesianImpedance:
             "tau_cmd": tau_cmd.copy(),
             "joint_ranges": self.ranges.copy(),
             "command_expired": expired,
-            "saturated_latched": self._sat_time >= float(self.config["blocked"]["sat_s"]),
-            "sat_time_s": self._sat_time,
+            "constraint_reset": shaped.get("constraint_reset"),
+            "saturated_latched": self._sat_union >= float(self.config["blocked"]["sat_s"]) - 1e-12,
+            "sat_time_s": self._sat_union,
             "sat_limit_s": float(self.config["blocked"]["sat_s"]),
             "power_on": self.power_on,
-            "guard_wrench": wrench_info["compensated_wrench_tcp"],
-            "observation_invalid": not np.all(np.isfinite(wrench_info["compensated_wrench_tcp"])),
+            "k_start": self.k_start.copy(),
+            "d_start": self.d_start.copy(),
+            "transition_elapsed": float(self.transition_elapsed),
+            "active_gear": self.active_gear,
+            "target_gear": self.target_gear,
+            "limits": dict(limits),
+            "tau_before": tau_before.copy(),
             "e": e.copy(),
-            **{f"ft_{key}": value for key, value in wrench_info.items()},
+            "execution": execution,
         }
         return tau_cmd, info
+
+    def _seed_wrench(self, state: dict) -> None:
+        measured = self.wrench.measure(
+            self.model,
+            self.data,
+            np.asarray(state["raw_wrench_sensor"], dtype=float),
+            np.asarray(state["ft_mat"], dtype=float),
+            np.asarray(state["ft_pos"], dtype=float),
+            np.asarray(state["tcp_pos"], dtype=float),
+            float(self.scene.wrench_sign),
+        )
+        self.wrench.update_sample(measured, int(state["tick"]), float(state.get("episode_time", 0.0)), 0.0)
+
+    def commit_applied(self, applied, dt: float, was_power_on: bool) -> None:
+        applied = np.asarray(applied, dtype=float).reshape(_ARM)
+        raw = self._last_tau_raw
+        before = self._tau_before
+        step = self.rate * float(dt)
+        magnitude = np.abs(raw) > self.tau_max + 1e-8
+        rate_hit = (np.abs(applied - before) >= step - 1e-9) & (np.abs(raw - applied) > 1e-8)
+        self.tau_prev = applied.copy()
+        if was_power_on:
+            return
+        if np.any(magnitude | rate_hit):
+            self._sat_union += float(dt)
+            self._pause_advance = True
+        else:
+            self._sat_union = 0.0
+            self._pause_advance = False
+        if self._sat_union >= float(self.config["blocked"]["sat_s"]) - 1e-12 and self.guard is not None and self.guard.failure is None:
+            self.reference.reanchor(self._tcp_pos, self._tcp_rot)
+            self.guard.latch(
+                {
+                    "tick": int(self.scene.tick),
+                    "time": self.sim_time,
+                    "reason": "saturation",
+                    "phase": self.phase,
+                    "pair": None,
+                    "geoms": None,
+                    "measured": float(self._sat_union),
+                    "limit": float(self.config["blocked"]["sat_s"]),
+                }
+            )
 
     def _sense(self, state: dict, dt: float) -> dict:
         idx = self.index
@@ -430,10 +567,23 @@ def control_step(controller: CartesianImpedance, guard, phase: str | None = None
     state = controller.scene.snapshot()
     if phase is not None and (guard.failure is None) and controller.guard.status == "RUNNING" and not controller.power_on:
         controller.phase = phase
+    was_power_on = bool(controller.power_on)
     tau, info = controller.compute(state, controller.scene.dt)
     if not info.get("apply", True):
         return state, info
     nxt = controller.scene.step_physics(tau)
-    used = info["phase_k"]
-    guard.observe(nxt, used, info)
+    measured = controller.wrench.measure(
+        controller.model,
+        controller.data,
+        np.asarray(nxt["raw_wrench_sensor"], dtype=float),
+        np.asarray(nxt["ft_mat"], dtype=float),
+        np.asarray(nxt["ft_pos"], dtype=float),
+        np.asarray(nxt["tcp_pos"], dtype=float),
+        float(controller.scene.wrench_sign),
+    )
+    sample = controller.wrench.update_sample(measured, int(nxt["tick"]), float(nxt["episode_time"]), float(controller.scene.dt))
+    controller.commit_applied(nxt["tau_command"], controller.scene.dt, was_power_on)
+    for key, value in sample.items():
+        info[f"ft_{key}"] = value
+    guard.observe(nxt, info["phase_k"], info, measurement=sample)
     return nxt, info

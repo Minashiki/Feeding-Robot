@@ -1,5 +1,6 @@
 {
-  "version": "m2-v1",
+  "version": "m2-fix-v1",
+  "command_valid_max_s": 0.1,
   "feature_length_m": 0.1,
   "epsilon_normal": 1e-8,
   "epsilon_singular": 1e-2,
