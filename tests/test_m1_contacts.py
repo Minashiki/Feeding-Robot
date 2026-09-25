@@ -13,6 +13,54 @@ from feedingrobot.sim.trajectory import quintic, smooth_pulse
 from feedingrobot.sim.trial import Trial
 
 
+def test_spoon_plate_is_forbidden_in_either_order():
+    def state(group1, group2, tick=1, speed=0.0):
+        return {
+            "dq": np.full(7, speed),
+            "contacts": [{
+                "group1": group1,
+                "group2": group2,
+                "geom1": group1 + "_geom",
+                "geom2": group2 + "_geom",
+                "dist": -1e-4,
+                "force_on_geom2_world": np.zeros(3),
+            }],
+            "tick": tick,
+            "finite": True,
+            "warnings": [],
+            "velocity_fault": False,
+        }
+
+    for first, second in (("spoon", "plate"), ("plate", "spoon")):
+        trial = Trial(1.0)
+        trial.observe(state(first, second))
+        assert trial.ok is False
+        assert trial.failure["reason"].startswith("forbidden contact")
+        assert trial.failure["pair"] == ("plate", "spoon")
+    for pair in (("arm", "table"), ("arm", "plate"), ("arm", "mouth"), ("spoon", "table"), ("spoon", "plate")):
+        for groups in (pair, pair[::-1]):
+            trial = Trial(1.0)
+            trial.observe(state(*groups))
+            assert trial.ok is False, groups
+    trial = Trial(1.0)
+    trial.observe(state("food", "plate"), extra_forbidden={("plate", "food")})
+    assert trial.ok is False
+    trial = Trial(1.0)
+    trial.observe(state("plate", "food"), extra_forbidden={("food", "plate")})
+    assert trial.ok is False
+    for groups in (("food", "spoon"), ("food", "plate"), ("spoon", "mouth")):
+        trial = Trial(1.0)
+        trial.observe(state(*groups))
+        assert trial.ok, groups
+    trial = Trial(1.0)
+    trial.observe(state("spoon", "plate", tick=3))
+    trial.observe({"dq": np.zeros(7), "contacts": [], "tick": 4, "finite": True, "warnings": [], "velocity_fault": False})
+    assert trial.failure["tick"] == 3
+    trial.observe(state("arm", "table", tick=9, speed=2.0))
+    assert trial.failure["tick"] == 3
+    assert "forbidden" in trial.failure["reason"]
+
+
 def _food_on(contacts, group):
     return any({c["group1"], c["group2"]} == {"food", group} for c in contacts)
 

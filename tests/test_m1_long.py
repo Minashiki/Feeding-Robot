@@ -61,15 +61,7 @@ def test_t12_nominal_10s(m1_config):
     )
 
 
-THRESHOLDS = {
-    "event_s": 0.02,
-    "steady_force_n": {"floor": 0.001, "frac": 0.1},
-    "peak_force_n": {"floor": 0.02, "frac": 0.1},
-    "vector_impulse_ns": {"floor": 1e-4, "frac": 0.1},
-    "scalar_impulse_ns": {"floor": 1e-4, "frac": 0.1},
-    "steady_food_pos_m": 0.002,
-    "min_contact_dist_m": -0.001,
-}
+from feedingrobot.sim.report import PAIR_THRESHOLDS as THRESHOLDS
 
 
 def _close(a, b, floor, frac):
@@ -79,17 +71,33 @@ def _close(a, b, floor, frac):
 def _comparison(kind, seed, pair, ref, cmp_, steady_ok, peak_ok, vec_ok, sca_ok):
     event_a = None if ref["event_s"] is None else float(ref["event_s"])
     event_b = None if cmp_["event_s"] is None else float(cmp_["event_s"])
+    left, right = pair.split("/")
+    needs_event = kind in ("tilt", "accel", "lip")
+    if needs_event:
+        event_ok = event_a is not None and event_b is not None and abs(event_a - event_b) <= 0.02
+        position_ok = "not_applicable"
+        position_delta = None
+    else:
+        event_ok = "not_applicable"
+        position_delta = float(np.linalg.norm(np.array(ref["steady_food_pos_m"]) - np.array(cmp_["steady_food_pos_m"])))
+        position_ok = position_delta <= 0.002
+    passed = bool(steady_ok and peak_ok and vec_ok and sca_ok and event_ok is not False and position_ok is not False)
     return {
         "kind": kind,
         "seed": int(seed),
         "pair": pair,
+        "case_a": f"{kind}_seed{int(seed)}_{left}",
+        "case_b": f"{kind}_seed{int(seed)}_{right}",
         "steady_ok": bool(steady_ok),
         "peak_ok": bool(peak_ok),
         "vector_impulse_ok": bool(vec_ok),
         "scalar_impulse_ok": bool(sca_ok),
+        "event_ok": event_ok,
+        "position_ok": position_ok,
         "event_a": event_a,
         "event_b": event_b,
         "delta_event_s": None if event_a is None or event_b is None else abs(event_a - event_b),
+        "position_delta_m": position_delta,
         "peak_a": float(ref["peak_force_n"]),
         "peak_b": float(cmp_["peak_force_n"]),
         "steady_a": ref["steady_force_n"],
@@ -99,7 +107,7 @@ def _comparison(kind, seed, pair, ref, cmp_, steady_ok, peak_ok, vec_ok, sca_ok)
         "scalar_a": float(ref["scalar_impulse_ns"]),
         "scalar_b": float(cmp_["scalar_impulse_ns"]),
         "thresholds": THRESHOLDS,
-        "conclusion": "passed" if steady_ok and peak_ok and vec_ok and sca_ok else "failed",
+        "conclusion": "passed" if passed else "failed",
     }
 
 

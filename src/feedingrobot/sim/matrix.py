@@ -11,7 +11,7 @@ import numpy as np
 from feedingrobot.sim.events import Departure, food_on_spoon, outside_support
 from feedingrobot.sim.trace import Trace
 from feedingrobot.sim.trajectory import quintic, smooth_pulse
-from feedingrobot.sim.trial import FORBIDDEN, Trial
+from feedingrobot.sim.trial import FORBIDDEN, Trial, is_forbidden_contact
 
 
 def state_digest(data) -> str:
@@ -87,12 +87,9 @@ def run_case(scene, snap, kind: str, duration_s: float) -> dict:
         else:
             tau = scene.bias_tau()
         state = scene.step_physics(tau, hold_driver=True)
-        banned = False
-        for row in state["contacts"]:
-            pair = tuple(sorted((row["group1"], row["group2"])))
-            if pair in FORBIDDEN:
-                banned = True
-        state["forbidden_contact"] = banned
+        state["forbidden_contact"] = any(
+            is_forbidden_contact(row["group1"], row["group2"], FORBIDDEN) for row in state["contacts"]
+        )
         trial.observe(state)
         group, other = partner_for(kind)
         force, peak = _group_force(state["contacts"], group, other)

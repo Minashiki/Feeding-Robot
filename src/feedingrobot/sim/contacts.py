@@ -20,6 +20,10 @@ _GROUPS = (
 )
 
 
+def contact_pair(a: str, b: str) -> tuple[str, str]:
+    return tuple(sorted((a, b)))
+
+
 def geom_group(name: str | None) -> str:
     if not name:
         return "arm"
@@ -69,7 +73,7 @@ def read_contacts(model, data) -> list[dict]:
 def pair_set(contacts: list[dict]) -> set[tuple[str, str]]:
     pairs = set()
     for row in contacts:
-        pairs.add(tuple(sorted((row["group1"], row["group2"]))))
+        pairs.add(contact_pair(row["group1"], row["group2"]))
     return pairs
 
 

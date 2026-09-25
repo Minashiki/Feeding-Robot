@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import numpy as np
 
-FORBIDDEN = {
-    ("arm", "table"),
-    ("arm", "plate"),
-    ("arm", "mouth"),
-    ("spoon", "table"),
-    ("spoon", "plate"),
-}
+from feedingrobot.sim.contacts import contact_pair
+
+
+def _pair_set(pairs) -> set[tuple[str, str]]:
+    return {contact_pair(a, b) for a, b in (pairs or ())}
+
+
+FORBIDDEN = _pair_set(
+    (
+        ("arm", "table"),
+        ("arm", "plate"),
+        ("arm", "mouth"),
+        ("spoon", "table"),
+        ("spoon", "plate"),
+    )
+)
+
+
+def is_forbidden_contact(group1: str, group2: str, banned: set[tuple[str, str]]) -> bool:
+    return contact_pair(group1, group2) in banned
 
 
 class Trial:
@@ -41,12 +54,19 @@ class Trial:
         elif dists and min(dists) < -1e-3:
             reason = f"penetration {min(dists):.5f}"
         else:
-            banned = FORBIDDEN | (extra_forbidden or set())
+            banned = FORBIDDEN | _pair_set(extra_forbidden)
             for row in state["contacts"]:
-                pair = tuple(sorted((row["group1"], row["group2"])))
-                if pair in banned:
-                    reason = f"forbidden contact {pair}"
-                    break
+                pair = contact_pair(row["group1"], row["group2"])
+                if is_forbidden_contact(row["group1"], row["group2"], banned):
+                    self.failure = {
+                        "tick": int(state["tick"]),
+                        "reason": f"forbidden contact {pair}",
+                        "speed": speed,
+                        "pair": pair,
+                        "geoms": (row.get("geom1"), row.get("geom2")),
+                        "dist": float(row["dist"]),
+                    }
+                    return
         if reason is not None:
             self.failure = {"tick": int(state["tick"]), "reason": reason, "speed": speed}
 

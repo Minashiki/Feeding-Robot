@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from feedingrobot.sim.trial import FORBIDDEN, is_forbidden_contact
+
 
 class Trace:
     def __init__(self):
@@ -36,7 +38,9 @@ class Trace:
                 "min_contact_dist": float(min((c["dist"] for c in state["contacts"]), default=0.0)),
                 "warning_count": int(sum(state["warnings"])),
                 "velocity_fault": bool(state["velocity_fault"]),
-                "forbidden_contact": bool(state.get("forbidden_contact", False)),
+                "forbidden_contact": any(
+                    is_forbidden_contact(row["group1"], row["group2"], FORBIDDEN) for row in state["contacts"]
+                ),
                 "event_candidate": bool(departure.candidate or departure.confirmed_s is not None),
                 "event_confirmed": bool(departure.confirmed_s is not None and state["episode_time"] + 1e-12 >= departure.confirmed_s),
                 "mouth_contact": any("mouth_upper" in (c["geom1"], c["geom2"]) for c in state["contacts"]),

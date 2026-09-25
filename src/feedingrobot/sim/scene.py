@@ -5,12 +5,18 @@ from __future__ import annotations
 import mujoco
 import numpy as np
 
-from feedingrobot.sim.contacts import min_distance, read_contacts
+from feedingrobot.sim.contacts import contact_pair, min_distance, read_contacts
 from feedingrobot.sim.model import ModelIndex, load_config, load_model, resolve_path
 from feedingrobot.sim.sensors import read_raw_wrench, site_position, site_rotation, world_and_tcp_wrench
 
 _ARM_TABLE_GROUPS = {"arm", "spoon"}
-_FORBIDDEN_RESET = {("arm", "table"), ("arm", "plate"), ("arm", "mouth"), ("spoon", "table"), ("spoon", "mouth")}
+_FORBIDDEN_RESET = {
+    contact_pair("arm", "table"),
+    contact_pair("arm", "plate"),
+    contact_pair("arm", "mouth"),
+    contact_pair("spoon", "table"),
+    contact_pair("spoon", "mouth"),
+}
 
 
 def _as_vec(value, n: int) -> np.ndarray:
@@ -330,7 +336,7 @@ class FeedingScene:
         if min_distance(contacts) < -1e-3:
             return True
         for row in contacts:
-            pair = tuple(sorted((row["group1"], row["group2"])))
+            pair = contact_pair(row["group1"], row["group2"])
             if pair in _FORBIDDEN_RESET or (
                 row["group1"] in _ARM_TABLE_GROUPS and row["group2"] in {"table", "plate", "mouth"}
             ):
