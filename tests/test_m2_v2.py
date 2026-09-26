@@ -447,7 +447,7 @@ def _bowl_force(contacts):
     return total
 
 
-def _record_physical(case_id, scene, states, twists, infos, inputs, meta):
+def _record_physical(case_id, scene, states, twists, infos, inputs, meta, extra=None):
     n = len(infos)
     forces = []
     torques = []
@@ -517,6 +517,7 @@ def _record_physical(case_id, scene, states, twists, infos, inputs, meta):
         contact_geom2=np.asarray(geom2, dtype=str),
         contact_frame=np.vstack(frames) if frames else np.zeros((0, 9)),
         contact_offsets=np.asarray(offsets, dtype=int),
+        **(extra or {}),
     )
     write_json(case_id, meta)
     del scene, n

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from feedingrobot.controllers.acceptance import SCHEMA_VERSION, SCOPE_NAME, collect_inputs, evaluate_evidence, required_case_ids
+from feedingrobot.controllers.acceptance import SCHEMA_VERSION, SCOPE_NAME, V6_SECOND_STAGE_NODEIDS, collect_inputs, evaluate_evidence, required_case_ids
 from feedingrobot.controllers.v3spec import RELEASE_SCORING_VERSION
 from feedingrobot.controllers.v3spec import evidence_paths
 from feedingrobot.sim.model import repo_root
@@ -89,7 +89,7 @@ def main():
     for key in ("M2_V3_PACKAGE", "M2_V4_PACKAGE", "M2_V5_PACKAGE", "M2_V6_PACKAGE", "M2_V3_RESULTS", "M2_V4_RESULTS", "M2_V5_RESULTS", "M2_V6_RESULTS"):
         env.pop(key, None)
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/test_m2_math.py", "tests/test_m2_tracking.py", "tests/test_m2_traj.py", "tests/test_m2_wrench.py", "tests/test_m2_guard.py", "tests/test_m2_fixes.py", "tests/test_m2_report.py", "tests/test_m2_v2.py", "tests/test_m2_v5.py", "tests/test_m2_v6.py", "-q"],
+        [sys.executable, "-m", "pytest", "tests/test_m2_math.py", "tests/test_m2_tracking.py", "tests/test_m2_traj.py", "tests/test_m2_wrench.py", "tests/test_m2_guard.py", "tests/test_m2_fixes.py", "tests/test_m2_report.py", "tests/test_m2_v2.py", "tests/test_m2_v5.py", "tests/test_m2_v6.py", "tests/test_m2_v6_r3.py", "-q"],
         cwd=root,
         capture_output=True,
         text=True,
@@ -147,7 +147,7 @@ def main():
     adv_env["M2_V6_RESULTS"] = str(out / "adversarial_results.json")
     adv_env["M1_EXECUTION_PATH"] = str(out / "adversarial_execution.json")
     adv_env["M1_RUN_ID"] = out.name + "-adversarial"
-    adv = subprocess.run([sys.executable, "-m", "pytest", "tests/test_m2_v6.py", "-q", "-k", "not concurrent and not cli"], cwd=root, capture_output=True, text=True, env=adv_env)
+    adv = subprocess.run([sys.executable, "-m", "pytest", *V6_SECOND_STAGE_NODEIDS, "-q"], cwd=root, capture_output=True, text=True, env=adv_env)
     (out / "adversarial_pytest.txt").write_text(adv.stdout + "\n" + adv.stderr)
     if adv.returncode != 0 or not (out / "adversarial_results.json").is_file():
         print(adv.stdout)

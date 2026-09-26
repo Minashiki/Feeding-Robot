@@ -87,52 +87,75 @@ STRUCTURAL = {
     "event_mismatch",
     "io_error",
 }
-ADVERSARIAL = (
-    "auto_resume",
-    "bad_dtype_tick",
-    "bad_offsets",
-    "bad_rotation",
-    "bad_shape_k",
-    "comparisons_lie",
-    "f6_limit",
-    "f6_missing_rot",
-    "f6_nan",
-    "failed_m1",
-    "fast_ramp",
-    "fast_skip",
-    "fast_speed",
-    "fault_tick",
-    "gain_huge",
-    "gear_fake_free",
-    "hash_stale",
-    "input_changed",
-    "joint_projection",
-    "k_nan",
-    "manifest_drop",
-    "manifest_dup",
-    "manifest_empty",
-    "missing_A",
-    "mode_aborted",
-    "mode_unknown",
-    "node_missing",
-    "pause_integral",
-    "pause_vref",
-    "q_100",
-    "release_fake_time",
-    "release_gap",
-    "release_json",
-    "release_reload",
-    "release_speed",
-    "release_two_frames",
-    "run_incomplete",
-    "singularity_stop",
-    "slow_ramp_late",
-    "slow_spike",
-    "solver_label",
-    "stop_speed",
-    "stop_torque",
-    "teardown_fail",
-)
+V6_R3_EXPECTED = {
+    "v6_tau_limit": {"torque_rate"},
+    "v6_gain": {"gain_path_mismatch"},
+    "v6_tau_nan": {"nonfinite"},
+    "v6_flag_nan": {"bad_dtype"},
+    "v6_shape": {"bad_shape"},
+    "v6_tick_dtype": {"bad_dtype"},
+    "v6_normal_fault": {"unexpected_fault"},
+    "v6_history": {"stimulus"},
+    "v6_empty_grid": {"stimulus"},
+    "v6_grid_boundary": {"stimulus"},
+    "v6_grid_dt": {"stimulus"},
+    "v6_early_unload": {"stimulus"},
+    "v6_load_direction": {"stimulus"},
+    "v6_load_time": {"stimulus"},
+    "v6_delayed_cross": {"convergence"},
+    "v6_initial_state": {"initial_state"},
+    "v6_missing_c": {"missing_case", "missing_comparison"},
+    "v6_comparison_drop": {"summary_mismatch"},
+}
+
+ADVERSARIAL_EXPECTED = {
+    'auto_resume': {'auto_resume'},
+    'bad_dtype_tick': {'bad_dtype'},
+    'bad_offsets': {'bad_offsets'},
+    'bad_rotation': {'invalid_rotation'},
+    'bad_shape_k': {'bad_shape'},
+    'comparisons_lie': {'summary_mismatch'},
+    'f6_limit': {'reference_error', 'threshold_mismatch'},
+    'f6_missing_rot': {'missing_field'},
+    'f6_nan': {'nonfinite'},
+    'failed_m1': {'m1_failed'},
+    'fast_ramp': {'unload_duration'},
+    'fast_skip': {'event_mismatch'},
+    'fast_speed': {'release_speed'},
+    'fault_tick': {'fault_tick'},
+    'gain_huge': {'gain_path_mismatch'},
+    'gear_fake_free': {'phase_gear_mismatch'},
+    'hash_stale': {'hash_mismatch'},
+    'input_changed': {'input_hash'},
+    'joint_projection': {'joint_projection'},
+    'k_nan': {'nonfinite'},
+    'manifest_drop': {'evidence_manifest'},
+    'manifest_dup': {'duplicate_path'},
+    'manifest_empty': {'evidence_manifest'},
+    'missing_A': {'missing_comparison'},
+    'mode_aborted': {'unexpected_mode'},
+    'mode_unknown': {'invalid_enum'},
+    'node_missing': {'nodeid'},
+    'pause_integral': {'pause_motion'},
+    'pause_vref': {'reference_speed'},
+    'q_100': {'joint_range'},
+    'release_fake_time': {'event_missing'},
+    'release_gap': {'bad_time'},
+    'release_json': {'wrong_type'},
+    'release_reload': {'external_reloaded'},
+    'release_speed': {'release_speed'},
+    'release_two_frames': {'event_missing', 'sample_count'},
+    'run_incomplete': {'run_incomplete'},
+    'singularity_stop': {'singularity_stop'},
+    'slow_ramp_late': {'release_speed'},
+    'slow_spike': {'release_speed'},
+    'solver_label': {'solver_mismatch'},
+    'stop_speed': {'stop_speed'},
+    'stop_torque': {'stop_torque'},
+    'teardown_fail': {'teardown'},
+    **V6_R3_EXPECTED,
+}
+ADVERSARIAL = tuple(sorted(ADVERSARIAL_EXPECTED))
 
 
 def reason(code, case_id=None, field=None, observed=None, expected=None, text=""):
@@ -521,7 +544,7 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
     except ValueError:
         _add(reasons, "nonfinite", case_id, "json")
         return None
-    from feedingrobot.controllers.v4fields import screen_arrays, semantic_arrays
+    from feedingrobot.controllers.v4fields import screen_arrays, semantic_arrays, hard_arrays
 
     found = screen_arrays(data, case_id, n, family, var["dt"])
     if found:
@@ -529,6 +552,7 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
         if family in {"release", "release_fast"} and any(item["code"] == "sample_count" for item in found):
             _add(reasons, "event_missing", case_id, "release_window")
         return None
+    reasons.extend(hard_arrays(data, case_id, family, var["dt"]))
     reasons.extend(semantic_arrays(data, case_id, family, var["dt"]))
     needed = (
         "t_state",
@@ -918,6 +942,24 @@ def _check_slow_stimulus(reasons, case_id, external, t_state, dt, unload_k, forc
         _add(reasons, "unload_duration", case_id, "force_zero", float(t_state[force_k] - t0), RELEASE_RAMP_S)
 
 
+def check_release_stimulus(reasons, case_id, command, external, dt, unload_k):
+    # hook runs before compute and observes the previous compute timestamp.
+    # At 0.04 s the corresponding physical interval is tick (0.04/dt + 1).
+    load_k = _step_count(dt, 0.04) + 1
+    push_k = _step_count(dt, 0.05)
+    expected_force = np.zeros_like(external[:unload_k])
+    expected_force[load_k:, 0] = -RELEASE_FORCE_N
+    expected_command = np.zeros_like(command[:unload_k])
+    expected_command[push_k:, 0] = 0.05
+    if unload_k <= push_k:
+        _add(reasons, "stimulus", case_id, "push_duration")
+    for field, actual, expected, tolerance in (("hold_force", external[:unload_k], expected_force, RAMP_FORCE_ATOL), ("push_command", command[:unload_k], expected_command, 1e-9)):
+        bad = np.flatnonzero(np.any(np.abs(actual - expected) > tolerance, axis=1))
+        if bad.size:
+            k = int(bad[0])
+            _add(reasons, "stimulus", case_id, field, text=f"stimulus {field} index={k} t={k * dt:.6f}")
+
+
 def _score_release(reasons, metrics, case_id, family, rebuilt, command, external, twist, tcp, t_state, dt, meta):
     found = _release_events(reasons, case_id, rebuilt, command, external)
     if found is None:
@@ -929,10 +971,7 @@ def _score_release(reasons, metrics, case_id, family, rebuilt, command, external
     if family == "release":
         metrics["events"]["blocked"] = float(t_state[blocked_k])
         metrics["events"]["release"] = float(t_state[force_k])
-    if not np.any(external[:unload_k, 0] < -2.5):
-        _add(reasons, "event_mismatch", case_id, "load")
-    if not np.any(command[:unload_k, 0] > 0.02):
-        _add(reasons, "event_mismatch", case_id, "push")
+    check_release_stimulus(reasons, case_id, command, external, dt, unload_k)
     full = _step_count(dt, 1.0)
     if family == "release_fast":
         gap = float(t_state[force_k] - t_state[unload_k])
@@ -994,15 +1033,18 @@ def _abc(metrics: dict, reasons: list) -> list[dict]:
         ("tcp_torque", 0.1, 0.002, "N*m"),
         ("impulse", 0.1, 1e-4, "N*s"),
     )
-    for family in PHYSICAL:
-        for seed in (0, 1, 2):
-            base_id = f"{family}-s{seed}-A"
+    families = [(family, (0, 1, 2)) for family in PHYSICAL]
+    families.extend((family, (None,)) for family in ("V6-zero-phys-upper", "V6-zero-phys-lower", "V6-stop-rest", "V6-stop-cross"))
+    for family, seeds in families:
+        for seed in seeds:
+            prefix = f"{family}-s{seed}" if seed is not None else family
+            base_id = f"{prefix}-A"
             base = metrics.get(base_id)
             if not base:
                 _add(reasons, "missing_comparison", base_id, "A")
                 continue
             for variant in ("B", "C"):
-                other_id = f"{family}-s{seed}-{variant}"
+                other_id = f"{prefix}-{variant}"
                 other = metrics.get(other_id)
                 if not other:
                     _add(reasons, "missing_comparison", other_id, variant)
@@ -1059,6 +1101,10 @@ def _abc(metrics: dict, reasons: list) -> list[dict]:
                         item["field"] = f"tau_{joint}"
                         reasons.append(item)
                 events = set(base["events"]) | set(other["events"])
+                if family.startswith("V6-stop-"):
+                    events.update(("fault", "stop_speed", "stop_confirm"))
+                elif family.startswith("V6-zero-"):
+                    rows.append({"family": family, "seed": seed, "pair": f"A/{variant}", "metric": "fault", "role": "not_applicable", "passed": None})
                 if family == "gear":
                     events.update(("contact", "switch", "gain_complete"))
                 if family == "release":
@@ -1196,6 +1242,9 @@ def evaluate_evidence(run, check_workspace: bool = False) -> dict:
         if listed != expected:
             _add(reasons, "manifest", field="case_manifest.json")
     _manifest_ok(run, reasons)
+    from feedingrobot.controllers.v6checks import CheckContext
+
+    context = CheckContext()
     metrics = {}
     if (run / "cases").is_dir():
         known = set(expected)
@@ -1214,7 +1263,7 @@ def evaluate_evidence(run, check_workspace: bool = False) -> dict:
                     if not target.is_file():
                         _add(reasons, "missing_case", case_id, "json")
                     else:
-                        reasons.extend(check_zero_grid(case_id, _load(target)))
+                        reasons.extend(check_zero_grid(case_id, _load(target), context))
                 elif kind == "v6trace":
                     from feedingrobot.controllers.v6checks import check_trace
 
@@ -1223,7 +1272,10 @@ def evaluate_evidence(run, check_workspace: bool = False) -> dict:
                     if not npz_path.is_file() or not js_path.is_file():
                         _add(reasons, "missing_case", case_id, "npz")
                     else:
-                        reasons.extend(check_trace(case_id, np.load(npz_path, allow_pickle=False), _load(js_path)))
+                        derived = {}
+                        with np.load(npz_path, allow_pickle=False) as data:
+                            reasons.extend(check_trace(case_id, data, _load(js_path), context, derived))
+                        metrics[case_id] = derived
                 elif kind == "array" and case_id == "F6-pause1000":
                     target = run / "cases" / f"{case_id}.npz"
                     if not target.is_file():
@@ -1362,7 +1414,9 @@ def _save_npz(path: Path, data) -> None:
 
 
 def apply_tamper(name: str, run: Path) -> None:
-    if name == "f6_limit":
+    if name in V6_R3_EXPECTED:
+        apply_v6_r3_tamper(name, run)
+    elif name == "f6_limit":
         path = run / "cases" / "F6-pause1000.npz"
         data = np.load(path, allow_pickle=False)
         payload = {key: data[key] for key in data.files}
@@ -1627,6 +1681,73 @@ def apply_tamper(name: str, run: Path) -> None:
         raise KeyError(name)
 
 
+def apply_v6_r3_tamper(name, run):
+    zero = "V6-zero-phys-upper-A"
+    if name in {"v6_empty_grid", "v6_grid_boundary", "v6_grid_dt"}:
+        rel = "cases/V6-zero-j0-upper-linear-A.json"
+        row = _load(run / rel)
+        if name == "v6_empty_grid":
+            row.update(jbar=np.zeros((7, 6)).tolist(), candidate=[0.] * 6, final=[0.] * 6, p_after=row["p_before"])
+        elif name == "v6_grid_boundary":
+            row["q"][0] -= 0.5
+        else:
+            row["dt"] = 0.0005
+        _unlink_write(run / rel, json.dumps(row))
+        _rehash(run, rel)
+        return
+    if name == "v6_missing_c":
+        (run / "cases/V6-stop-cross-C.npz").unlink()
+        return
+    if name == "v6_comparison_drop":
+        path = run / "comparisons.json"
+        rows = [row for row in _load(path) if not str(row.get("family", "")).startswith("V6-")]
+        _unlink_write(path, json.dumps(rows))
+        return
+    case = "release_fast-s0-A" if name in {"v6_early_unload", "v6_load_direction", "v6_load_time"} else ("V6-stop-cross-B" if name in {"v6_delayed_cross", "v6_initial_state"} else zero)
+    def edit(payload):
+        if name == "v6_tau_limit":
+            payload["tau_applied"][:, 6] = np.minimum(np.arange(len(payload["tau_applied"])) + 1, 50)
+        elif name == "v6_gain":
+            payload["K"][:] = 1e9
+        elif name == "v6_tau_nan":
+            payload["tau_before"][0] = np.nan
+        elif name == "v6_flag_nan":
+            payload["transition_active"] = np.full(len(payload["transition_active"]), np.nan)
+        elif name == "v6_shape":
+            payload["dq"] = payload["dq"][:-1]
+        elif name == "v6_tick_dtype":
+            payload["tick"] = payload["tick"].astype(float)
+        elif name == "v6_normal_fault":
+            payload["fault_tick"] = np.int64(100)
+            payload["first_fault_tick"] = np.int64(100)
+        elif name == "v6_history":
+            payload["history_twist0"][:] = 0
+            payload["candidate"][:] = 0
+            payload["final_twist"][:] = 0
+        elif name == "v6_early_unload":
+            mask = (payload["t_state"][:-1] >= 0.05) & (payload["t_state"][:-1] < 0.149)
+            payload["external_wrench"][mask, 0] = -0.001
+        elif name == "v6_load_direction":
+            payload["external_wrench"][60, 1] = 3.0
+        elif name == "v6_load_time":
+            payload["external_wrench"][42, 0] = 0.0
+        elif name == "v6_initial_state":
+            payload["qpos0"][0] += 0.01
+        elif name == "v6_delayed_cross":
+            n = len(payload["command"])
+            shift = 200
+            for key, arr in list(payload.items()):
+                if key in {"tick", "t_state"} or key.startswith("contact_"):
+                    continue
+                if arr.ndim and arr.shape[0] in {n, n + 1}:
+                    payload[key] = np.concatenate([np.repeat(arr[:1], shift, axis=0), arr[:-shift]], axis=0)
+            payload["fault_tick"] += shift
+            payload["first_fault_tick"] += shift
+        else:
+            raise KeyError(name)
+    _edit_case(run, case, edit)
+
+
 def _edit_case(run: Path, case_id: str, edit) -> None:
     path = run / "cases" / f"{case_id}.npz"
     data = np.load(path, allow_pickle=False)
@@ -1651,17 +1772,22 @@ def run_adversarial(run, fail_after: str | None = None) -> list[dict]:
     source_id = _tree_id(run)
     results = []
     names = tuple(sorted(ADVERSARIAL))
+    # One clean evaluation plus byte-identical copies is equivalent to repeatedly
+    # solving the same clean evidence. Every modified copy is still evaluated afresh.
     try:
         with tempfile.TemporaryDirectory(prefix="m2-v4-adversarial-") as work:
+            if fail_after is None:
+                clean = evaluate_evidence(run, check_workspace=True)
+                if clean["reasons"]:
+                    return [{"name": name, "fixes_passed": False, "evidence_valid": clean["evidence_valid"], "codes": ["clean_copy", *[item["code"] for item in clean["reasons"]]]} for name in names]
             for name in names:
                 with tempfile.TemporaryDirectory(prefix="case-", dir=work) as case_work:
                     dest = Path(case_work) / "run"
                     shutil.copytree(run, dest, copy_function=shutil.copy2)
                     if fail_after == name:
                         raise RuntimeError(name)
-                    clean = evaluate_evidence(dest, check_workspace=True)
-                    if clean["reasons"]:
-                        results.append({"name": name, "fixes_passed": False, "evidence_valid": clean["evidence_valid"], "codes": ["clean_copy", *[item["code"] for item in clean["reasons"]]]})
+                    if _tree_id(dest) != source_id:
+                        results.append({"name": name, "fixes_passed": False, "evidence_valid": False, "codes": ["clean_copy", "io_error"]})
                         continue
                     apply_tamper(name, dest)
                     verdict = evaluate_evidence(dest, check_workspace=True)
@@ -1713,6 +1839,19 @@ def _drop_index(run: Path, case_id: str, index: int) -> None:
     np.savez(path, **payload)
 
 
+def check_second_stage(execution, reasons):
+    from feedingrobot.controllers.acceptance import V6_SECOND_STAGE_NODEIDS
+
+    reports = execution.get("reports") or []
+    collected = execution.get("collected") or []
+    if int(execution.get("exitstatus", 1)) != 0:
+        _add(reasons, "exitstatus", field="adversarial_execution.json")
+    for node in V6_SECOND_STAGE_NODEIDS:
+        phases = {when: [item.get("outcome") for item in reports if item.get("nodeid") == node and item.get("when") == when] for when in ("setup", "call", "teardown")}
+        if collected.count(node) != 1 or any(values != ["passed"] for values in phases.values()):
+            _add(reasons, "nodeid", field=node)
+
+
 def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
     from feedingrobot.controllers.acceptance import REMAINING_FULL_M2, SCHEMA_VERSION, SCOPE_NAME
 
@@ -1762,8 +1901,17 @@ def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
     core_fixes = not verdict["reasons"]
     if report.get("fixes_passed") is not core_fixes or report.get("evidence_valid") is not verdict["evidence_valid"]:
         _add(reasons, "summary_mismatch", field="report.json")
+    if scope == "fixes-v6":
+        exec_path = run / "adversarial_execution.json"
+        if not exec_path.is_file():
+            _add(reasons, "missing_file", field="adversarial_execution.json")
+        else:
+            execution = _load(exec_path)
+            if int(execution.get("exitstatus", 1)) != 0:
+                _add(reasons, "exitstatus", field="adversarial_execution.json")
+            check_second_stage(execution, reasons)
     adv_path = run / "adversarial_results.json"
-    if scope == "fixes-v6" and not any(item["code"] in STRUCTURAL for item in verdict["reasons"]):
+    if scope == "fixes-v6" and not reasons:
         fresh = run_adversarial(run)
         if not adv_path.is_file():
             _add(reasons, "missing_file", field="adversarial_results.json")
@@ -1772,24 +1920,8 @@ def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
             if not _same(stored, fresh):
                 _add(reasons, "summary_mismatch", field="adversarial_results.json")
             for row in fresh:
-                if row["fixes_passed"] or not row["codes"]:
+                if row["fixes_passed"] or not row["codes"] or "clean_copy" in row["codes"] or not ADVERSARIAL_EXPECTED.get(row["name"], set()).issubset(row["codes"]):
                     _add(reasons, "summary_mismatch", field=row["name"])
-        exec_path = run / "adversarial_execution.json"
-        if not exec_path.is_file():
-            _add(reasons, "missing_file", field="adversarial_execution.json")
-        else:
-            execution = _load(exec_path)
-            if int(execution.get("exitstatus", 1)) != 0:
-                _add(reasons, "exitstatus", field="adversarial_execution.json")
-            from feedingrobot.controllers.acceptance import V6_PACKAGE_NODEID
-
-            reports = execution.get("reports") or []
-            wanted = {"setup": [], "call": [], "teardown": []}
-            for item in reports:
-                if item.get("nodeid") == V6_PACKAGE_NODEID and item.get("when") in wanted:
-                    wanted[item["when"]].append(item.get("outcome"))
-            if V6_PACKAGE_NODEID not in (execution.get("collected") or []) or wanted["setup"] != ["passed"] or wanted["call"] != ["passed"] or wanted["teardown"] != ["passed"]:
-                _add(reasons, "nodeid", field=V6_PACKAGE_NODEID)
     if scope == "full":
         _add(reasons, "full_incomplete", text="full M2 still missing: " + "; ".join(REMAINING_FULL_M2))
         reasons[-1]["text"] = "full M2 still missing: " + "; ".join(REMAINING_FULL_M2)

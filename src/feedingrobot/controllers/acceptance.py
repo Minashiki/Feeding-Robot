@@ -15,6 +15,13 @@ from feedingrobot.sim.report import assess_run
 SCHEMA_VERSION = "m2-fix-v6"
 SCOPE_NAME = "fixes_v6"
 V6_PACKAGE_NODEID = "tests/test_m2_v6.py::test_v6_package_tampers_are_rejected"
+V6_SECOND_STAGE_NODEIDS = (
+    V6_PACKAGE_NODEID,
+    "tests/test_m2_v6.py::test_v6_copies_do_not_use_hardlinks",
+    "tests/test_m2_v6.py::test_v6_exception_leaves_the_source_package",
+    "tests/test_m2_v6.py::test_v6_concurrent_copies_stay_isolated",
+)
+
 F4_SPEED_LIMIT_M_S = 0.01
 JOINT_SPEED_LIMIT = 0.5
 JOINT_PREDICT_LIMIT = 0.4
@@ -195,6 +202,7 @@ def required_case_ids() -> list[str]:
 
 def required_nodeids() -> list[str]:
     nodes = list(LEGACY_NODEIDS)
+    nodes.extend(f"tests/test_m2_v6_r3.py::{name}" for name in ("test_v6_common_contracts", "test_v6_fixed_grid_contract", "test_v6_fixed_release_clock", "test_v6_second_stage_nodes", "test_v6_pair_contracts", "test_v6_corrupted_copy_rejected"))
     for case_id in f4_joint_case_ids():
         nodes.append(f"tests/test_m2_v2.py::test_f4_joint_cell[{case_id}]")
     for case_id in ("F4-speed", "F4-pair", "F4-recover", "F4-scale-0", "F4-scale-0.1", "F4-scale-1"):

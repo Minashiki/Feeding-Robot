@@ -63,7 +63,20 @@ CROSS_DQ = np.array(
 ZERO_DURATION_S = 0.3
 STOP_DURATION_S = 1.0
 
-_SCENE = None
+class CheckContext:
+    """Owned by one evaluation; never shared between concurrent calls."""
+
+    def __init__(self):
+        import mujoco
+        from feedingrobot.sim.scene import FeedingScene
+
+        self.scene = FeedingScene("configs/m1_scene.json")
+        self.mujoco = mujoco
+
+    @property
+    def ranges(self):
+        return np.array(self.scene.model.jnt_range[self.scene.index.arm_joint_ids], dtype=float)
+
 
 
 def _reason(code, case_id, field, observed=None, expected=None, text=""):
@@ -98,24 +111,8 @@ def joint_beta(jbar, twist, q, ranges) -> float:
     return float(np.clip(beta, 0.0, 1.0))
 
 
-def _scene():
-    global _SCENE
-    if _SCENE is None:
-        import mujoco
-
-        from feedingrobot.sim.scene import FeedingScene
-
-        _SCENE = (FeedingScene("configs/m1_scene.json"), mujoco)
-    return _SCENE
-
-
-def _ranges():
-    scene, _mujoco = _scene()
-    return np.array(scene.model.jnt_range[scene.index.arm_joint_ids], dtype=float)
-
-
-def _arm_state(q, dq):
-    scene, mujoco = _scene()
+def _arm_state(q, dq, context):
+    scene, mujoco = context.scene, context.mujoco
     scene.data.qpos[scene.index.arm_qpos_adr] = np.asarray(q, dtype=float).reshape(7)
     scene.data.qvel[scene.index.arm_dof_adr] = np.asarray(dq, dtype=float).reshape(7)
     mujoco.mj_forward(scene.model, scene.data)
@@ -139,11 +136,21 @@ def _rho(jacobian) -> float:
     return float(singular[-1] / singular[0])
 
 
-def check_zero_grid(case_id: str, row: dict) -> list[dict]:
+def check_zero_grid(case_id: str, row: dict, context=None) -> list[dict]:
     reasons = []
+    context = context or CheckContext()
     need = ("q", "jbar", "candidate", "final", "p_before", "p_after", "correction", "dt")
     if any(key not in row for key in need):
         return [_reason("missing_field", case_id, "grid")]
+    shapes = {"q": (7,), "jbar": (7, 6), "candidate": (6,), "final": (6,), "p_before": (3,), "p_after": (3,), "correction": (3,), "dt": ()}
+    for field, shape in shapes.items():
+        arr = np.asarray(row[field])
+        if arr.shape != shape:
+            return [_reason("bad_shape", case_id, field)]
+        if arr.dtype.kind not in "fi":
+            return [_reason("bad_dtype", case_id, field)]
+        if not np.all(np.isfinite(arr)):
+            return [_reason("nonfinite", case_id, field)]
     q = np.asarray(row["q"], dtype=float).reshape(7)
     jbar = np.asarray(row["jbar"], dtype=float).reshape(7, 6)
     candidate = np.asarray(row["candidate"], dtype=float).reshape(6)
@@ -154,7 +161,27 @@ def check_zero_grid(case_id: str, row: dict) -> list[dict]:
     dt = float(row["dt"])
     if not all(np.all(np.isfinite(item)) for item in (q, jbar, candidate, final, correction, before, after)):
         return [_reason("nonfinite", case_id, "grid")]
-    beta = joint_beta(jbar, candidate, q, _ranges())
+    parts = case_id.split("-")
+    from feedingrobot.controllers.acceptance import v6_zero_grid_ids
+    if case_id not in v6_zero_grid_ids():
+        return [_reason("stimulus", case_id, "case_id")]
+    joint, side, motion, variant = int(parts[2][1:]), parts[3], parts[4], parts[5]
+    expected_q = np.array(context.scene.config["q_torque_poses"][0], dtype=float)
+    expected_q[joint] = context.ranges[joint, 1] - 0.04 if side == "upper" else context.ranges[joint, 0] + 0.04
+    expected_jbar = np.zeros((7, 6))
+    expected_candidate = np.zeros(6)
+    sign = 1.0 if side == "upper" else -1.0
+    if motion in {"linear", "mixed"}:
+        expected_jbar[joint, 0] = sign
+        expected_candidate[0] = 0.05 if motion == "linear" else 0.02
+    if motion in {"angular", "mixed"}:
+        expected_jbar[joint, 3] = sign
+        expected_candidate[3] = 0.5 if motion == "angular" else 0.2
+    expected_dt = 0.001 if variant == "A" else 0.0005
+    for field, actual, expected_input in (("q", q, expected_q), ("jbar", jbar, expected_jbar), ("candidate", candidate, expected_candidate), ("dt", dt, expected_dt), ("p_before", before, np.zeros(3)), ("correction", correction, np.zeros(3))):
+        if not np.allclose(actual, expected_input, atol=1e-12, rtol=0):
+            reasons.append(_reason("stimulus", case_id, field))
+    beta = joint_beta(jbar, candidate, q, context.ranges)
     expected = np.zeros(6) if beta <= 1e-15 else candidate * beta
     if not np.allclose(final, expected, atol=1e-9, rtol=0.0):
         reasons.append(_reason("joint_projection", case_id, "final", float(np.linalg.norm(final)), float(np.linalg.norm(expected))))
@@ -180,9 +207,11 @@ def _as_str(values) -> np.ndarray:
     return np.asarray(values).astype(str)
 
 
-def check_trace(case_id: str, data, meta: dict) -> list[dict]:
+def check_trace(case_id: str, data, meta: dict, context=None, metrics=None) -> list[dict]:
     from feedingrobot.controllers.v3spec import VARIANTS
+    from feedingrobot.controllers.v4fields import screen_arrays, hard_arrays, semantic_arrays
 
+    context = context or CheckContext()
     reasons = []
     variant = _variant(case_id)
     if variant not in VARIANTS:
@@ -195,6 +224,44 @@ def check_trace(case_id: str, data, meta: dict) -> list[dict]:
         reasons.append(_reason("solver_mismatch", case_id, "iterations"))
     duration = STOP_DURATION_S if case_id.startswith("V6-stop-") else ZERO_DURATION_S
     n = int(round(duration / dt))
+    extras = {name: (("N", "7"), "float") for name in ("tau_task", "tau_null", "tau_bias")}
+    extras.update({name: (("N", "6"), "float") for name in ("candidate", "final_twist")})
+    extras.update({"beta": (("N",), "float"), "history_twist0": (("6",), "float"), "fault_tick": ((), "int"), "fault_reason": ((), "text"), "stopped_ok": ((), "flag")})
+    found = screen_arrays(data, case_id, n, "base", dt, extra_specs=extras)
+    if found:
+        return reasons + found
+    data = {key: np.asarray(data[key]) for key in data}
+    reasons.extend(hard_arrays(data, case_id, "base", dt))
+    if int(data["fault_tick"]) != int(data["first_fault_tick"]):
+        reasons.append(_reason("fault_tick", case_id, "first_fault_tick"))
+    scene = context.scene
+    # Rebuild the frozen complete initial snapshot, not just the seven arm coordinates.
+    scene.reset(seed=0, preset="food_on_plate", settle_steps=0)
+    name = case_id.split("-")[-2]
+    initial_q = np.array(scene.config["q_torque_poses"][0], dtype=float)
+    initial_dq = np.zeros(7)
+    if name in {"upper", "lower"}:
+        initial_q[0] = context.ranges[0, 1] - 0.04 if name == "upper" else context.ranges[0, 0] + 0.04
+    else:
+        initial_q = SINGULAR_Q if name == "rest" else CROSS_Q
+        initial_dq = REST_DQ if name == "rest" else CROSS_DQ
+    scene.data.qpos[scene.index.arm_qpos_adr] = initial_q
+    scene.data.qvel[scene.index.arm_dof_adr] = initial_dq
+    for field, expected_initial in (("qpos0", scene.data.qpos), ("qvel0", scene.data.qvel)):
+        recorded_meta = np.asarray(meta.get(field, []), dtype=float)
+        if recorded_meta.shape != expected_initial.shape or not np.allclose(recorded_meta, expected_initial, atol=1e-8, rtol=0) or not np.allclose(data[field], expected_initial, atol=1e-8, rtol=0):
+            reasons.append(_reason("initial_state", case_id, field))
+    if not np.allclose(data["q"][0], initial_q, atol=1e-8, rtol=0) or not np.allclose(data["dq"][0], initial_dq, atol=1e-8, rtol=0):
+        reasons.append(_reason("initial_state", case_id, "first_frame"))
+    context.mujoco.mj_forward(scene.model, scene.data)
+    initial = scene.snapshot()
+    for field, actual, expected_initial in (("tcp_pos", data["tcp_pos"][0], initial["tcp_pos"]), ("tcp_rot", data["tcp_rot"][0], np.asarray(initial["tcp_mat"]).reshape(3, 3)), ("p_ref_before", data["p_ref_before"][0], initial["tcp_pos"]), ("r_ref_before", data["r_ref_before"][0], np.asarray(initial["tcp_mat"]).reshape(3, 3))):
+        if not np.allclose(actual, expected_initial, atol=1e-8, rtol=0):
+            reasons.append(_reason("initial_state", case_id, field))
+    if not np.allclose(data["tau_before"], scene.data.qfrc_bias[scene.index.arm_dof_adr], atol=1e-7, rtol=0):
+        reasons.append(_reason("initial_state", case_id, "tau_before"))
+    if np.any(np.abs(data["external_wrench"]) > 1e-9) or np.any(data["phase"] != "TRANSPORT"):
+        reasons.append(_reason("stimulus", case_id, "external_or_phase"))
     try:
         t_state = np.asarray(data["t_state"], dtype=float)
         q = np.asarray(data["q"], dtype=float)
@@ -225,11 +292,15 @@ def check_trace(case_id: str, data, meta: dict) -> list[dict]:
         reasons.append(_reason("bad_time", case_id, "dt"))
     if np.max(np.abs(dq)) > SPEED_LIMIT + 1e-9:
         reasons.append(_reason("joint_speed", case_id, "dq", float(np.max(np.abs(dq))), SPEED_LIMIT))
-    ranges = _ranges()
+    ranges = context.ranges
     if np.any(q < ranges[:, 0] - 1e-6) or np.any(q > ranges[:, 1] + 1e-6):
         reasons.append(_reason("joint_range", case_id, "q"))
+    events = {}
     if case_id.startswith("V6-zero-phys-"):
-        reasons.extend(_check_zero_trace(case_id, data, q, dq, command, execution, guard_status, v_ref, tau_applied, tau_before, dt, n))
+        reasons.extend(semantic_arrays(data, case_id, "base", dt))
+        if int(data["fault_tick"]) != -1 or str(data["fault_reason"]) != "" or int(data["stopped_ok"]) != 0:
+            reasons.append(_reason("unexpected_fault", case_id, "fault_tick"))
+        reasons.extend(_check_zero_trace(case_id, data, q, dq, command, execution, guard_status, v_ref, tau_applied, tau_before, dt, n, context))
     else:
         reasons.extend(
             _check_stop_trace(
@@ -254,12 +325,16 @@ def check_trace(case_id: str, data, meta: dict) -> list[dict]:
                 v_ref,
                 dt,
                 n,
+                context,
+                events,
             )
         )
+    if metrics is not None:
+        metrics.update(trace_metrics(case_id, data, dt, events))
     return reasons
 
 
-def _check_zero_trace(case_id, data, q, dq, command, execution, guard_status, v_ref, tau_applied, tau_before, dt, n):
+def _check_zero_trace(case_id, data, q, dq, command, execution, guard_status, v_ref, tau_applied, tau_before, dt, n, context):
     reasons = []
     try:
         candidate = np.asarray(data["candidate"], dtype=float)
@@ -271,22 +346,38 @@ def _check_zero_trace(case_id, data, q, dq, command, execution, guard_status, v_
         return [_reason("missing_field", case_id, str(exc).strip("'"))]
     if candidate.shape != (n, 6) or final.shape != (n, 6) or p_ref.shape != (n, 3):
         return [_reason("bad_shape", case_id, "candidate")]
-    if np.any(guard_status != "RUNNING") or np.any(~np.isin(execution, ["zero", "run"])):
+    if np.any(guard_status != "RUNNING") or np.any(execution != "zero"):
         reasons.append(_reason("unexpected_fault", case_id, "guard_status"))
-    home = np.array(_scene()[0].config["q_torque_poses"][0], dtype=float)
+    home = np.array(context.scene.config["q_torque_poses"][0], dtype=float)
     side = 1.0 if "-upper-" in case_id else -1.0
-    home[0] = _ranges()[0, 1] - 0.04 if side > 0 else _ranges()[0, 0] + 0.04
+    home[0] = context.ranges[0, 1] - 0.04 if side > 0 else context.ranges[0, 0] + 0.04
     if np.max(np.abs(q[0] - home)) > 1e-8:
         reasons.append(_reason("initial_state", case_id, "q", float(q[0, 0]), float(home[0])))
+    if np.any(np.abs(command) > 1e-12):
+        reasons.append(_reason("stimulus", case_id, "command"))
+    _sc, jac0, mass0, _bias0 = _arm_state(q[0], dq[0], context)
+    scale_matrix = np.diag([1., 1., 1., LENGTH, LENGTH, LENGTH])
+    _null0, jbar0, _lam0 = damped_nullspace(scale_matrix @ jac0, mass0, EPS_NORMAL, A_FLOOR)
+    history = np.zeros(6)
+    history[:3] = side * 0.01 * jbar0[0, :3] / np.linalg.norm(jbar0[0, :3])
+    if not np.allclose(data["history_twist0"], history, atol=1e-9, rtol=0):
+        reasons.append(_reason("stimulus", case_id, "history_twist0"))
     outward_hit = None
     for k in range(n):
+        speed = np.linalg.norm(history[:3])
+        expected_candidate = history.copy()
+        expected_candidate[:3] *= max(0.0, 1.0 - 0.25 * dt / speed) if speed > 0 else 0.0
+        if not np.allclose(candidate[k], expected_candidate, atol=1e-9, rtol=0):
+            reasons.append(_reason("stimulus", case_id, "candidate", text=f"stimulus candidate index={k}"))
+            break
+        history = final[k].copy()
         if execution[k] not in {"zero", "run"}:
             continue
-        _scene_k, jacobian, mass, _bias = _arm_state(q[k], dq[k])
+        _scene_k, jacobian, mass, _bias = _arm_state(q[k], dq[k], context)
         rho = _rho(jacobian)
         _scale, eps = singularity_gains(rho, EPS_NORMAL, EPS_SINGULAR, RHO_NORMAL, RHO_STOP)
         _null, jbar, _lam = damped_nullspace(np.diag([1.0, 1.0, 1.0, LENGTH, LENGTH, LENGTH]) @ jacobian, mass, eps, A_FLOOR)
-        beta = joint_beta(jbar, candidate[k], q[k], _ranges())
+        beta = joint_beta(jbar, candidate[k], q[k], context.ranges)
         expected = np.zeros(6) if beta <= 1e-15 else candidate[k] * beta
         if not np.allclose(final[k], expected, atol=1e-8, rtol=0.0):
             reasons.append(_reason("joint_projection", case_id, "final_twist", float(np.linalg.norm(final[k])), float(np.linalg.norm(expected)), text=f"joint_projection t={float(data['t_state'][k])}"))
@@ -303,7 +394,7 @@ def _check_zero_trace(case_id, data, q, dq, command, execution, guard_status, v_
         reasons.append(_reason("joint_projection", case_id, "qdot_pred", outward_hit[1], 0.0, text=f"joint_projection index={outward_hit[0]}"))
     if np.max(np.abs(tau_applied[0] - tau_before)) > TAU_RATE * dt + 1e-6 or np.max(np.abs(np.diff(tau_applied, axis=0))) > TAU_RATE * dt + 1e-6:
         reasons.append(_reason("torque_rate", case_id, "tau_applied"))
-    if np.any(np.linalg.norm(v_ref, axis=1) > 0.05 + 1e-6):
+    if np.any(np.linalg.norm(v_ref[:, :3], axis=1) > 0.05 + 1e-6) or np.any(np.linalg.norm(v_ref[:, 3:], axis=1) > 0.3 + 1e-6):
         reasons.append(_reason("reference_speed", case_id, "v_ref"))
     del command
     return reasons
@@ -331,17 +422,21 @@ def _check_stop_trace(
     v_ref,
     dt,
     n,
+    context,
+    events,
 ):
     reasons = []
     target_q = SINGULAR_Q if case_id.startswith("V6-stop-rest-") else CROSS_Q
     target_dq = REST_DQ if case_id.startswith("V6-stop-rest-") else CROSS_DQ
     if np.max(np.abs(q[0] - target_q)) > 1e-8 or np.max(np.abs(dq[0] - target_dq)) > 1e-8:
         reasons.append(_reason("initial_state", case_id, "q"))
+    if np.any(np.abs(data["history_twist0"]) > 1e-12):
+        reasons.append(_reason("stimulus", case_id, "history_twist0"))
     fault_k = None
     rhos = np.zeros(n + 1)
     biases = np.zeros((n, 7))
     for k in range(n + 1):
-        scene, jacobian, _mass, bias = _arm_state(q[k], dq[k])
+        scene, jacobian, _mass, bias = _arm_state(q[k], dq[k], context)
         rhos[k] = _rho(jacobian)
         if k < n:
             biases[k] = bias
@@ -351,6 +446,8 @@ def _check_stop_trace(
             if float(scene.data.contact[i].dist) < -0.001:
                 reasons.append(_reason("reference_error", case_id, "contact_dist", float(scene.data.contact[i].dist), -0.001))
                 break
+    if fault_k is not None and fault_k >= n:
+        return reasons + [_reason("sample_count", case_id, "stop_window")]
     if fault_k is None:
         return reasons + [_reason("singularity_stop", case_id, "rho", float(np.min(rhos)), RHO_STOP)]
     if case_id.startswith("V6-stop-rest-") and fault_k != 0:
@@ -371,6 +468,11 @@ def _check_stop_trace(
         reasons.append(_reason("fault_tick", case_id, "fault_tick", logged_tick, int(ticks[fault_k]) if ticks.shape == (n + 1,) else -1, text=f"fault_tick logged={logged_tick}"))
     if np.any(phase != "TRANSPORT"):
         reasons.append(_reason("singularity_stop", case_id, "phase"))
+    expected_command = np.zeros((fault_k, 6))
+    if case_id.startswith("V6-stop-cross-"):
+        expected_command[:, 0] = 0.02
+    if not np.allclose(command[:fault_k], expected_command, atol=1e-12, rtol=0):
+        reasons.append(_reason("stimulus", case_id, "command"))
     for k in range(fault_k):
         if mode[k] != "RUNNING" or guard_status[k] != "RUNNING" or execution[k] == "stop":
             reasons.append(_reason("singularity_stop", case_id, "pre_stop", text=f"singularity_stop pre_stop index={k}"))
@@ -402,12 +504,21 @@ def _check_stop_trace(
         if not np.allclose(tau_applied[k], expected_applied, atol=1e-6, rtol=0.0):
             reasons.append(_reason("torque_rate", case_id, "tau_applied"))
             break
-    _stop_speed(reasons, case_id, t_state, dq, fault_k)
+    events["fault"] = float(t_state[fault_k])
+    held = _stop_speed(reasons, case_id, t_state, dq, fault_k)
+    if held is not None:
+        expected_mode = np.where(t_state[fault_k:n] >= held[1] - 1e-12, "STOPPED", "STOPPING")
+        if np.any(mode[fault_k:] != expected_mode):
+            reasons.append(_reason("singularity_stop", case_id, "stop_confirm_mode"))
+        events["stop_speed"] = held[0]
+        events["stop_confirm"] = held[1]
+    if int(data["stopped_ok"]) != 1:
+        reasons.append(_reason("stop_speed", case_id, "stopped_ok"))
     if fault_k > 0:
         from feedingrobot.controllers.v4fields import check_logged_gains
 
         prefix = slice(0, fault_k)
-        check_logged_gains(
+        built = check_logged_gains(
             stiffness[prefix],
             damping[prefix],
             transition[prefix],
@@ -418,6 +529,8 @@ def _check_stop_trace(
             case_id,
             reasons,
         )
+        if built is not None and (np.any(np.linalg.norm(v_ref[prefix, :3], axis=1) > built["v_lim"] + 1e-9) or np.any(np.linalg.norm(v_ref[prefix, 3:], axis=1) > built["w_lim"] + 1e-9)):
+            reasons.append(_reason("reference_speed", case_id, "v_ref"))
     return reasons
 
 
@@ -441,3 +554,31 @@ def _stop_speed(reasons, case_id, t_state, dq, fault_k):
     window = (t_state >= float(t_state[reached]) - 1e-12) & (t_state <= hold_end + 1e-12)
     if int(np.count_nonzero(window)) < 2 or np.any(speed[window] > STOP_SPEED + 1e-9):
         reasons.append(_reason("stop_speed", case_id, "dq", float(np.max(speed[window])) if np.any(window) else None, STOP_SPEED, text="stop_speed hold"))
+
+    else:
+        return float(t_state[reached]), hold_end
+
+
+def trace_metrics(case_id, data, dt, events):
+    from feedingrobot.controllers.so3 import orientation_error
+
+    times = data["t_state"][1:]
+    pos = np.linalg.norm(data["p_ref"] - data["tcp_pos"][1:], axis=1)
+    rot = np.array([np.linalg.norm(orientation_error(ref, actual)) for ref, actual in zip(data["r_ref"], data["tcp_rot"][1:])])
+    wrench = data["wrench_compensated"]
+    force = np.linalg.norm(wrench[:, :3], axis=1)
+    torque = np.linalg.norm(wrench[:, 3:], axis=1)
+    contact_peak = np.zeros(len(times))
+    contact_sum = np.zeros(len(times))
+    offsets = data["contact_offsets"]
+    for k in range(len(times)):
+        contact = data["contact_force"][offsets[k]:offsets[k + 1]]
+        if len(contact):
+            contact_peak[k] = np.max(np.linalg.norm(contact, axis=1))
+            contact_sum[k] = np.sum(np.linalg.norm(contact, axis=1))
+    series = {"pos_peak": pos, "rot_peak": rot, "tcp_force": force, "tcp_torque": torque, "contact_force": contact_peak, "contact_sum": contact_sum}
+    metrics = {key: float(np.max(value)) for key, value in series.items()}
+    metrics["times"] = {key: float(times[np.argmax(value)]) for key, value in series.items()}
+    metrics.update({"pos_rms": float(np.sqrt(np.mean(pos**2))), "rot_rms": float(np.sqrt(np.mean(rot**2))), "impulse": float(np.sum(force) * dt), "tau_peak": np.max(np.abs(data["tau_applied"]), axis=0), "qpos0": data["qpos0"], "qvel0": data["qvel0"], "events": events})
+    metrics["times"].update({"pos_rms": float(times[0]), "rot_rms": float(times[0]), "impulse": float(times[-1])})
+    return metrics

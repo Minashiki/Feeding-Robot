@@ -1,6 +1,5 @@
 """V6: zero-command projection, singularity stop, and staged release windows."""
 
-import inspect
 import os
 import shutil
 import tempfile
@@ -25,7 +24,7 @@ from feedingrobot.controllers.v6checks import (
 from feedingrobot.sim.scene import FeedingScene
 from tests.m2_evidence import write_json, write_npz
 from tests.m2_support import load_m2_config, place_arm, start_controller
-from tests.test_m2_v2 import _apply_variant
+from tests.test_m2_v2 import _apply_variant, _record_physical, _tcp_twist
 
 
 def _codes(reasons):
@@ -312,8 +311,8 @@ def _release_arrays(n=2500, dt=0.001, blocked=149, ramp=1.2):
     t_state = np.arange(n + 1) * dt
     command = np.zeros((n, 6))
     external = np.zeros((n, 6))
-    command[: blocked + 1, 0] = 0.05
-    external[: blocked + 1, 0] = -3.0
+    command[int(round(0.05 / dt)): blocked + 1, 0] = 0.05
+    external[int(round(0.04 / dt)) + 1: blocked + 1, 0] = -3.0
     unload = blocked + 1
     force = unload + int(round(ramp / dt))
     for k in range(unload, force):
@@ -491,14 +490,26 @@ def _trace(case_id):
     publish = max(int(round(0.05 / scene.dt)), 1)
     states = [scene.snapshot()]
     rows = []
-    p_before = []
+    inputs = {key: [] for key in ("command", "external", "force_used", "pause", "saturation", "blocked", "p_ref_before", "r_ref_before", "guard_status")}
+    twists = [_tcp_twist(scene)]
+    history = np.concatenate([ctl.reference.v_lin, ctl.reference.v_ang]).copy()
     for i in range(steps):
-        p_before.append(np.array(ctl.reference.p_ref, dtype=float).copy())
+        inputs["p_ref_before"].append(ctl.reference.p_ref.copy())
+        inputs["r_ref_before"].append(ctl.reference.r_ref.copy())
+        cached = ctl.wrench._cache
+        inputs["force_used"].append(np.zeros(3) if cached is None else np.array(cached["compensated_wrench_tcp"][:3]))
+        inputs["pause"].append(int(ctl._pause_advance))
+        inputs["external"].append(np.zeros(6))
         if i % publish == 0 and guard.failure is None:
             ctl.set_command(twist, ctl.sim_time, ctl.sim_time + 0.1, ctl.phase)
         state, info = control_step(ctl, guard)
         rows.append(info)
         states.append(state)
+        twists.append(_tcp_twist(scene))
+        inputs["command"].append(np.asarray(info["twist_command"]))
+        inputs["saturation"].append(int(bool(info.get("saturated_latched"))))
+        inputs["blocked"].append(int(bool(info.get("blocked_now"))))
+        inputs["guard_status"].append(str(info["status"]))
     assert len(rows) == steps
     if name in {"upper", "lower"}:
         assert guard.failure is None
@@ -519,40 +530,20 @@ def _trace(case_id):
         "qpos0": qpos,
         "qvel0": qvel,
     }
-    write_json(case_id, meta)
-    write_npz(
-        case_id,
-        t_state=np.array([row["episode_time"] for row in states], dtype=float),
-        tick=np.array([row["tick"] for row in states], dtype=int),
-        q=np.vstack([row["q"] for row in states]),
-        dq=np.vstack([row["dq"] for row in states]),
-        command=np.vstack([np.asarray(info["twist_command"], dtype=float) for info in rows]),
-        execution=np.array([str(info["execution"]) for info in rows]),
-        mode=np.array([str(info["control_mode"]) for info in rows]),
-        guard_status=np.array([str(info["status"]) for info in rows]),
-        phase=np.array([str(info["phase_k"]) for info in rows]),
-        active_gear=np.array([str(info["active_gear"]) for info in rows]),
-        target_gear=np.array([str(info["target_gear"]) for info in rows]),
-        K=np.vstack([np.asarray(info["k"], dtype=float) for info in rows]),
-        D=np.vstack([np.asarray(info["d"], dtype=float) for info in rows]),
-        transition_active=np.asarray([1 if info["transition_active"] else 0 for info in rows], dtype=np.int8),
-        tau_task=np.vstack([np.asarray(info["tau_task"], dtype=float) for info in rows]),
-        tau_null=np.vstack([np.asarray(info["tau_null"], dtype=float) for info in rows]),
-        tau_bias=np.vstack([np.asarray(info["tau_bias"], dtype=float) for info in rows]),
-        tau_raw=np.vstack([np.asarray(info["tau_raw"], dtype=float) for info in rows]),
-        tau_applied=np.vstack([row["tau_command"] for row in states[1:]]),
-        tau_before=np.asarray(bias, dtype=float),
-        v_ref=np.vstack([np.asarray(info["v_ref"], dtype=float) for info in rows]),
-        p_ref=np.vstack([np.asarray(info["p_ref"], dtype=float) for info in rows]),
-        p_ref_before=np.vstack(p_before),
-        reference_correction_pos=np.vstack([np.asarray(info["reference_correction_pos"], dtype=float) for info in rows]),
-        candidate=np.vstack([np.asarray(info["candidate_twist"], dtype=float) for info in rows]),
-        final_twist=np.vstack([np.asarray(info["twist_limited"], dtype=float) for info in rows]),
-        beta=np.array([float(info["beta"]) for info in rows]),
-        fault_tick=np.int64(-1 if guard.failure is None else guard.failure["tick"]),
-        fault_reason=np.array("" if guard.failure is None else str(guard.failure["reason"])),
-        stopped_ok=np.int8(1 if guard.stopped_ok else 0),
-    )
+    meta["tau_before"] = bias
+    meta["first_fault_tick"] = None if guard.failure is None else guard.failure["tick"]
+    _record_physical(case_id, scene, states, twists, rows, inputs, meta, extra={
+        "tau_task": np.vstack([info["tau_task"] for info in rows]),
+        "tau_null": np.vstack([info["tau_null"] for info in rows]),
+        "tau_bias": np.vstack([info["tau_bias"] for info in rows]),
+        "candidate": np.vstack([info["candidate_twist"] for info in rows]),
+        "final_twist": np.vstack([info["twist_limited"] for info in rows]),
+        "beta": np.array([float(info["beta"]) for info in rows]),
+        "history_twist0": history,
+        "fault_tick": np.int64(-1 if guard.failure is None else guard.failure["tick"]),
+        "fault_reason": np.array("" if guard.failure is None else str(guard.failure["reason"])),
+        "stopped_ok": np.int8(1 if guard.stopped_ok else 0),
+    })
     return rows
 
 
@@ -572,52 +563,9 @@ if os.environ.get("M2_V6_PACKAGE"):
         before = evaluate_evidence(package, check_workspace=True)
         assert before["fixes_passed"] is True
         rows = run_adversarial(package)
-        expected = {
-            "auto_resume": {"auto_resume"},
-            "bad_dtype_tick": {"bad_dtype"},
-            "bad_offsets": {"bad_offsets"},
-            "bad_rotation": {"invalid_rotation"},
-            "bad_shape_k": {"bad_shape"},
-            "comparisons_lie": {"summary_mismatch"},
-            "f6_limit": {"threshold_mismatch", "reference_error"},
-            "f6_missing_rot": {"missing_field"},
-            "f6_nan": {"nonfinite"},
-            "failed_m1": {"m1_failed"},
-            "fast_ramp": {"unload_duration"},
-            "fast_skip": {"event_mismatch"},
-            "fast_speed": {"release_speed"},
-            "fault_tick": {"fault_tick"},
-            "gain_huge": {"gain_path_mismatch"},
-            "gear_fake_free": {"phase_gear_mismatch"},
-            "hash_stale": {"hash_mismatch"},
-            "input_changed": {"input_hash"},
-            "joint_projection": {"joint_projection"},
-            "k_nan": {"nonfinite"},
-            "manifest_drop": {"evidence_manifest"},
-            "manifest_dup": {"duplicate_path"},
-            "manifest_empty": {"evidence_manifest"},
-            "missing_A": {"missing_comparison"},
-            "mode_aborted": {"unexpected_mode"},
-            "mode_unknown": {"invalid_enum"},
-            "node_missing": {"nodeid"},
-            "pause_integral": {"pause_motion"},
-            "pause_vref": {"reference_speed"},
-            "q_100": {"joint_range"},
-            "release_fake_time": {"event_missing"},
-            "release_gap": {"bad_time"},
-            "release_json": {"wrong_type"},
-            "release_reload": {"external_reloaded"},
-            "release_speed": {"release_speed"},
-            "release_two_frames": {"sample_count", "event_missing"},
-            "run_incomplete": {"run_incomplete"},
-            "singularity_stop": {"singularity_stop"},
-            "slow_ramp_late": {"release_speed"},
-            "slow_spike": {"release_speed"},
-            "solver_label": {"solver_mismatch"},
-            "stop_speed": {"stop_speed"},
-            "stop_torque": {"stop_torque"},
-            "teardown_fail": {"teardown"},
-        }
+        from feedingrobot.controllers.v3spec import ADVERSARIAL_EXPECTED
+
+        expected = ADVERSARIAL_EXPECTED
         assert [row["name"] for row in rows] == list(ADVERSARIAL)
         for row in rows:
             assert row["fixes_passed"] is False
@@ -629,9 +577,34 @@ if os.environ.get("M2_V6_PACKAGE"):
         if path:
             Path(path).write_text(json.dumps(rows, indent=2))
 
-    def test_v6_copies_do_not_use_hardlinks():
-        assert "os.link" not in inspect.getsource(run_adversarial)
-        assert "copy2" in inspect.getsource(shutil.copytree) or "copy_function=shutil.copy2" in inspect.getsource(run_adversarial)
+    def test_v6_copies_do_not_use_hardlinks(monkeypatch):
+        from feedingrobot.controllers import v3spec
+
+        package = Path(os.environ["M2_V6_PACKAGE"])
+        before = v3spec._tree_id(package)
+        original_copytree = shutil.copytree
+        copies = []
+
+        def inspect_copy(source, destination, *args, **kwargs):
+            result = original_copytree(source, destination, *args, **kwargs)
+            if Path(source).resolve() == package.resolve():
+                dest = Path(destination)
+                copies.append(dest)
+                assert v3spec._tree_id(dest) == before
+                for path in package.rglob("*"):
+                    if path.is_file():
+                        copied = dest / path.relative_to(package)
+                        assert (path.stat().st_dev, path.stat().st_ino) != (copied.stat().st_dev, copied.stat().st_ino)
+                # Exercise the real executor's copy, before its injected exception.
+                (dest / "run.json").write_text("modified private copy")
+                assert v3spec._tree_id(package) == before
+            return result
+
+        monkeypatch.setattr(v3spec.shutil, "copytree", inspect_copy)
+        with pytest.raises(RuntimeError, match="^auto_resume$"):
+            v3spec.run_adversarial(package, fail_after="auto_resume")
+        assert len(copies) == 1 and not copies[0].exists()
+        assert v3spec._tree_id(package) == before
 
     def test_v6_exception_leaves_the_source_package():
         package = Path(os.environ["M2_V6_PACKAGE"])
@@ -653,35 +626,29 @@ if os.environ.get("M2_V6_PACKAGE"):
 
     def test_v6_concurrent_copies_stay_isolated():
         import threading
-
-        from feedingrobot.controllers.v3spec import evaluate_evidence
+        from concurrent.futures import ThreadPoolExecutor
+        from feedingrobot.controllers.v3spec import _tree_id, apply_tamper, evaluate_evidence
 
         package = Path(os.environ["M2_V6_PACKAGE"])
-        digest = __import__("hashlib").sha256()
-        files = sorted(path for path in package.rglob("*") if path.is_file())
-        for path in files:
-            digest.update(path.read_bytes())
-        before = digest.digest()
-        errors = []
-
-        def _once():
-            try:
+        before = _tree_id(package)
+        serial = evaluate_evidence(package, check_workspace=False)
+        assert serial["fixes_passed"]
+        for tamper_one in (False, True):
+            barrier = threading.Barrier(2, timeout=60)
+            def once(index):
                 with tempfile.TemporaryDirectory(prefix="m2-v6-concurrent-") as work:
                     dest = Path(work) / "run"
                     shutil.copytree(package, dest, copy_function=shutil.copy2)
-                    verdict = evaluate_evidence(dest, check_workspace=False)
-                    if not verdict["fixes_passed"]:
-                        errors.append(verdict["reasons"][:2])
-            except Exception as exc:
-                errors.append(repr(exc))
-
-        threads = [threading.Thread(target=_once) for _ in range(2)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-        digest = __import__("hashlib").sha256()
-        for path in files:
-            digest.update(path.read_bytes())
-        assert errors == []
-        assert digest.digest() == before
+                    if tamper_one and index == 0:
+                        apply_tamper("v6_tau_limit", dest)
+                    barrier.wait()
+                    return evaluate_evidence(dest, check_workspace=False)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(once, (0, 1)))
+            assert results[1] == serial
+            if tamper_one:
+                assert results[0]["fixes_passed"] is False
+                assert "torque_rate" in _codes(results[0]["reasons"])
+            else:
+                assert results[0] == serial
+        assert _tree_id(package) == before

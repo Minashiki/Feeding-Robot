@@ -90,7 +90,7 @@ def _text_dtype(dtype) -> bool:
     return dtype.kind in {"U", "S"}
 
 
-def screen_arrays(data, case_id: str, n: int, family: str, dt: float) -> list[dict]:
+def screen_arrays(data, case_id: str, n: int, family: str, dt: float, extra_specs=None) -> list[dict]:
     """Reject bad dtype or shape before any cast. Returns reasons; empty means the arrays may be used."""
     layout = model_layout(family)
     reasons = []
@@ -142,9 +142,9 @@ def screen_arrays(data, case_id: str, n: int, family: str, dt: float) -> list[di
         "contact_frame",
     )
     for name in names:
-        if name not in data.files:
+        if name not in data:
             reasons.append(_reason("missing_field", case_id, name))
-    if "t_state" in data.files:
+    if "t_state" in data:
         times = data["t_state"]
         if times.ndim == 1 and _float_dtype(times.dtype) and times.size >= 2 and np.any(np.abs(np.diff(np.array(times, dtype=float)) - dt) > 1e-9):
             reasons.append(_reason("bad_time", case_id, "dt"))
@@ -202,8 +202,12 @@ def screen_arrays(data, case_id: str, n: int, family: str, dt: float) -> list[di
         "contact_geom2": (("C",), "text"),
         "contact_frame": (("C", "9"), "float"),
     }
+    specs.update(extra_specs or {})
     for name, (shape, kind) in specs.items():
-        arr = data[name]
+        if name not in data:
+            reasons.append(_reason("missing_field", case_id, name))
+            continue
+        arr = np.asarray(data[name])
         expected = _shape_of(shape, n, count, layout["nq"], layout["nv"])
         if arr.shape != expected:
             code = "sample_count" if name == "t_state" and arr.ndim == 1 else "bad_shape"
@@ -238,6 +242,63 @@ def _rotations_ok(mats) -> bool:
     err = np.max(np.abs(gram - eye), axis=(-2, -1))
     det = np.linalg.det(mats)
     return bool(np.all(err <= 1e-6) and np.all(np.abs(det - 1.0) <= 1e-6))
+
+
+def hard_arrays(data, case_id: str, family: str, dt: float) -> list[dict]:
+    """Unconditional physical constraints; expected stops receive no exemption."""
+    from feedingrobot.controllers.guard import contact_allowed
+    from feedingrobot.controllers.v3spec import BOWL, GEAR_POS, SPEED_LIMIT, TAU_MAX, TAU_RATE
+    from feedingrobot.controllers.so3 import orientation_error
+
+    data = {key: np.asarray(data[key]) for key in ("command", "tick", "t_state", "q", "dq", "tau_applied", "tau_before", "phase", "mode", "guard_status", "execution", "active_gear", "target_gear", "warnings", "contact_offsets", "contact_dist", "contact_geom1", "contact_geom2", "wrench_compensated", "p_ref", "r_ref", "tcp_pos", "tcp_rot")}
+    reasons = []
+    n = len(data["command"])
+    if not np.array_equal(data["tick"], np.arange(n + 1)) or not np.allclose(data["t_state"], np.arange(n + 1) * dt, atol=1e-9, rtol=0):
+        reasons.append(_reason("bad_time", case_id, "tick"))
+    q = data["q"]
+    ranges = model_layout(family)["range"]
+    if np.any(q < ranges[:, 0] - 1e-6) or np.any(q > ranges[:, 1] + 1e-6):
+        reasons.append(_reason("joint_range", case_id, "q"))
+    if np.max(np.abs(data["dq"])) > SPEED_LIMIT + 1e-9:
+        reasons.append(_reason("joint_speed", case_id, "dq"))
+    tau = data["tau_applied"]
+    if np.any(np.abs(tau) > TAU_MAX + 1e-9):
+        reasons.append(_reason("torque_rate", case_id, "tau_max"))
+    if np.max(np.abs(np.diff(np.vstack([data["tau_before"], tau]), axis=0))) > TAU_RATE * dt + 1e-9:
+        reasons.append(_reason("torque_rate", case_id, "tau_applied"))
+    enums = {"phase": set(PHASES), "mode": MODES | {"STOPPED"}, "guard_status": {"RUNNING", "STOPPING", "STOPPED", "ABORTED"}, "execution": EXECUTIONS, "active_gear": GEARS, "target_gear": GEARS}
+    for name, allowed in enums.items():
+        if any(str(value) not in allowed for value in data[name]):
+            reasons.append(_reason("invalid_enum", case_id, name))
+    if np.any(data["warnings"] != 0):
+        reasons.append(_reason("unexpected_fault", case_id, "warnings"))
+    offsets = data["contact_offsets"]
+    limits = {"FREE": (8.0, 0.8), "ACQUIRE": (4.0, 0.4), "MOUTH": (2.0, 0.2), "STOP": (8.0, 0.8)}
+    for k in range(n):
+        phase = str(data["phase"][k])
+        if phase not in GEAR_OF:
+            continue
+        gear = GEAR_OF[phase]
+        if np.linalg.norm(data["p_ref"][k] - data["tcp_pos"][k]) > GEAR_POS[gear] + 1e-9:
+            reasons.append(_reason("reference_error", case_id, "position", index=k))
+            break
+        rot_limit = {"FREE": 0.13962634, "ACQUIRE": 0.08726646, "MOUTH": 0.05235988, "STOP": 0.13962634}[gear]
+        if np.linalg.norm(orientation_error(data["r_ref"][k], data["tcp_rot"][k])) > rot_limit + 1e-9:
+            reasons.append(_reason("reference_error", case_id, "orientation", index=k))
+            break
+        force_lim, torque_lim = limits[gear]
+        wrench = data["wrench_compensated"][k]
+        if np.linalg.norm(wrench[:3]) > force_lim + 1e-9 or np.linalg.norm(wrench[3:]) > torque_lim + 1e-9:
+            reasons.append(_reason("wrench_limit", case_id, "wrench_compensated", index=k))
+            break
+        for j in range(int(offsets[k]), int(offsets[k + 1])):
+            if data["contact_dist"][j] < -0.001:
+                reasons.append(_reason("reference_error", case_id, "contact_dist", index=k))
+                break
+            if not contact_allowed(phase, str(data["contact_geom1"][j]), str(data["contact_geom2"][j]), {"press_test": family == "gear", "bowl_geoms": tuple(BOWL)}):
+                reasons.append(_reason("event_missing", case_id, "contact_whitelist", index=k))
+                break
+    return reasons
 
 
 def semantic_arrays(data, case_id: str, family: str, dt: float) -> list[dict]:
