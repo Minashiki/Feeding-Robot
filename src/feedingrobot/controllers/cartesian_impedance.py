@@ -463,6 +463,7 @@ class CartesianImpedance:
             "lam2": lam2,
             "scale": shaped["scale"],
             "blocked": shaped["blocked"],
+            "blocked_now": bool(shaped.get("blocked_now", False)),
             "reanchored": shaped["reanchored"],
             "tau_task": jacobian.T @ wrench_c,
             "tau_bias": bias.copy(),

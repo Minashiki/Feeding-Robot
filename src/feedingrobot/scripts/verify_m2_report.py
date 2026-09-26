@@ -17,15 +17,33 @@ def assess_m2(run: Path, scope: str, check_workspace: bool) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Check an M2 run directory without resimulating.")
     parser.add_argument("--run", required=True)
-    parser.add_argument("--scope", default="full", choices=("fixes-v1", "fixes-v2", "full"))
+    parser.add_argument("--scope", default="full", choices=("fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4", "fixes-v5", "full"))
     parser.add_argument("--check-current-workspace", action="store_true")
     args = parser.parse_args()
     run = Path(args.run)
     if not run.is_absolute():
         run = repo_root() / run
     verdict = assess_m2(run, args.scope, args.check_current_workspace)
-    print(json.dumps({key: verdict[key] for key in ("fixes_passed", "m3_ready", "evidence_valid", "hybrid_force_status", "reasons")}, indent=2))
-    if args.scope == "fixes-v2" and verdict["fixes_passed"] and verdict["m3_ready"] is False:
+    printable = []
+    for item in verdict["reasons"]:
+        if isinstance(item, dict):
+            printable.append(item.get("text") or item.get("code"))
+        else:
+            printable.append(str(item))
+    print(
+        json.dumps(
+            {
+                "fixes_passed": verdict["fixes_passed"],
+                "m3_ready": verdict["m3_ready"],
+                "evidence_valid": verdict["evidence_valid"],
+                "scope_passed": verdict.get("scope_passed"),
+                "hybrid_force_status": verdict["hybrid_force_status"],
+                "reasons": printable,
+            },
+            indent=2,
+        )
+    )
+    if args.scope == "fixes-v5" and verdict.get("scope_passed") and verdict["m3_ready"] is False:
         return
     raise SystemExit(1)
 

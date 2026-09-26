@@ -10,7 +10,6 @@ import pytest
 from feedingrobot.controllers.acceptance import f4_joint_case_ids, f5_case_ids, physical_case_ids
 from feedingrobot.controllers.so3 import integrate_rotation, orientation_error
 from feedingrobot.controllers.wrench import body_spatial
-from feedingrobot.sim.contacts import min_distance
 from feedingrobot.sim.scene import FeedingScene
 from tests.m2_evidence import write_json, write_npz
 from tests.m2_support import load_m2_config, place_arm, start_controller
@@ -207,33 +206,56 @@ def test_f6_case(case_id, rig):
         out = _shape_deviation(cfg, np.array([0.03, 0.0, 0.0]), np.eye(3), "run", True)
         assert np.max(np.abs(out["p_ref"] - np.array([0.01, 0, 0]))) <= 1e-9
         assert np.linalg.norm(out["v_ref"]) == 0.0
-        write_json(case_id, {"p_ref": out["p_ref"], "correction": out["reference_correction_pos"], "v_ref": 0.0})
+        write_json(
+            case_id,
+            {
+                "pos": [0.03, 0.0, 0.0],
+                "p_ref": out["p_ref"],
+                "correction": out["reference_correction_pos"],
+                "v_ref": out["v_ref"],
+                "limit": 0.02,
+            },
+        )
         return
     if case_id == "F6-within":
-        out = _shape_deviation(cfg, np.array([0.005, 0, 0]), np.eye(3), "run", True)
+        pos = np.array([0.005, 0.0, 0.0])
+        out = _shape_deviation(cfg, pos, np.eye(3), "run", True)
         assert np.linalg.norm(out["p_ref"]) <= 1e-12
-        write_json(case_id, {"error": 0.005, "limit": 0.02, "p_ref": out["p_ref"]})
+        write_json(case_id, {"pos": pos, "p_ref": out["p_ref"], "v_ref": out["v_ref"], "limit": 0.02})
         return
     if case_id == "F6-pause1000":
         from feedingrobot.controllers.reference import ReferenceShaper
 
         shaper = ReferenceShaper(cfg)
         shaper.anchor_pose(np.zeros(3), np.eye(3), np.zeros(7))
-        worst = 0.0
+        pos_rows = []
+        ref_rows = []
+        vel_rows = []
         for i in range(1000):
             pos = np.array([0.03 * math.sin(i / 50.0), 0.0, 0.0])
             out = shaper.shape(np.zeros(6), pos, np.eye(3), np.zeros(3), 0.001, _limits(), 1.0, 1.0, True, True, "run")
-            worst = max(worst, float(np.linalg.norm(out["p_ref"] - pos)))
+            err = float(np.linalg.norm(out["p_ref"] - pos))
+            assert err <= 0.02 + 1e-9
             assert np.linalg.norm(out["v_ref"]) == 0.0
-        assert worst <= 0.02 + 1e-9
-        write_json(case_id, {"error": worst, "limit": 0.02})
+            pos_rows.append(pos)
+            ref_rows.append(out["p_ref"])
+            vel_rows.append(out["v_ref"])
+        write_npz(
+            case_id,
+            pos=np.vstack(pos_rows),
+            p_ref=np.vstack(ref_rows),
+            v_ref=np.vstack(vel_rows),
+            integral=np.zeros((1000, 3)),
+            limit=np.array(0.02),
+        )
         return
     if case_id in {"F6-rot", "F6-both"}:
         rot_ref = integrate_rotation(np.eye(3), np.array([1.0, 0.0, 0.0]), 0.4)
         from feedingrobot.controllers.reference import ReferenceShaper
 
+        anchor = np.array([0.03, 0, 0]) if case_id == "F6-both" else np.zeros(3)
         shaper = ReferenceShaper(cfg)
-        shaper.anchor_pose(np.array([0.03, 0, 0]) if case_id == "F6-both" else np.zeros(3), rot_ref, np.zeros(7))
+        shaper.anchor_pose(anchor, rot_ref, np.zeros(7))
         limits = _limits(rot_dev=0.1)
         pos = np.array([0.03, 0, 0]) if case_id == "F6-rot" else np.zeros(3)
         out = shaper.shape(np.zeros(6), pos, np.eye(3), np.zeros(3), 0.001, limits, 1.0, 1.0, True, True, "run")
@@ -241,17 +263,25 @@ def test_f6_case(case_id, rig):
         assert ang <= 0.1 + 1e-9
         perr = float(np.linalg.norm(out["p_ref"] - pos))
         assert perr <= 0.02 + 1e-9
-        if case_id == "F6-rot":
-            write_json(case_id, {"error": ang, "limit": 0.1})
-        else:
-            write_json(case_id, {"error": perr, "limit": 0.02, "rot_error": ang, "rot_limit": 0.1})
+        write_json(
+            case_id,
+            {
+                "pos": pos,
+                "p_ref": out["p_ref"],
+                "rot": np.eye(3),
+                "r_ref": out["r_ref"],
+                "v_ref": out["v_ref"],
+                "limit": 0.1 if case_id == "F6-rot" else 0.02,
+            },
+        )
         return
     execution = {"F6-prohibit": "prohibit", "F6-stop": "stop", "F6-power-on": "power_on"}[case_id]
-    out = _shape_deviation(cfg, np.array([0.03, 0, 0]), np.eye(3), execution)
-    err = float(np.linalg.norm(out["p_ref"] - np.array([0.03, 0, 0])))
+    pos = np.array([0.03, 0, 0])
+    out = _shape_deviation(cfg, pos, np.eye(3), execution)
+    err = float(np.linalg.norm(out["p_ref"] - pos))
     assert err <= 0.02 + 1e-9
     assert np.linalg.norm(out["v_ref"]) == 0.0
-    write_json(case_id, {"error": err, "limit": 0.02})
+    write_json(case_id, {"pos": pos, "p_ref": out["p_ref"], "v_ref": out["v_ref"], "execution": execution, "limit": 0.02, "integral": [0.0, 0.0, 0.0]})
 
 
 @pytest.mark.parametrize("case_id", ["F2-com-0", "F2-com-1", "F2-com-2"])
@@ -397,25 +427,110 @@ def _apply_variant(scene, variant):
         scene.model.opt.tolerance = float(scene._opt_baseline["tolerance"] * 0.1)
 
 
-def _record_physical(case_id, samples, dt):
-    state_rows = [row[0] for row in samples]
-    info_rows = [row[1] for row in samples]
-    t = np.array([row["episode_time"] for row in state_rows], dtype=float)
-    dq = np.vstack([row["dq"] for row in state_rows])
-    tau = np.vstack([row["tau_command"] for row in state_rows])
-    tcp = np.vstack([row["tcp_pos"] for row in state_rows])
-    pref = np.vstack([np.asarray(info["p_ref"], dtype=float) for info in info_rows])
-    vref = np.vstack([np.asarray(info["v_ref"], dtype=float) for info in info_rows])
-    wrench = np.vstack([np.asarray(info.get("ft_compensated_wrench_tcp", np.zeros(6)), dtype=float) for info in info_rows])
-    contact = np.array([sum(float(np.linalg.norm(item["force_contact"])) for item in row["contacts"]) for row in state_rows])
-    dist = np.array([min_distance(row["contacts"]) for row in state_rows])
-    gains = np.vstack([np.asarray(info["k"], dtype=float) for info in info_rows])
-    write_npz(case_id, t=t, dq=dq, tau=tau, tcp=tcp, p_ref=pref, v_ref=vref, wrench=wrench, contact=contact, min_dist=dist, k=gains, dt=np.array(dt), tau0=np.asarray(info_rows[0].get("tau_before", np.zeros(7)), dtype=float))
-    return t, dq, tau, tcp, pref
+def _tcp_twist(scene):
+    vel = np.zeros(6)
+    mujoco.mj_objectVelocity(scene.model, scene.data, mujoco.mjtObj.mjOBJ_SITE, int(scene.index.site_ids["tcp"]), vel, 0)
+    return np.concatenate([vel[3:], vel[:3]])
+
+
+def _bowl_force(contacts):
+    total = np.zeros(3)
+    bowls = {"bowl_bottom", "bowl_back", "bowl_left", "bowl_right", "bowl_front"}
+    for row in contacts:
+        names = {row.get("geom1"), row.get("geom2")}
+        if "spring_pad" not in names or not (names & bowls):
+            continue
+        if row.get("geom1") in bowls:
+            total += np.asarray(row["force_on_geom1_world"], dtype=float)
+        else:
+            total += np.asarray(row["force_on_geom2_world"], dtype=float)
+    return total
+
+
+def _record_physical(case_id, scene, states, twists, infos, inputs, meta):
+    n = len(infos)
+    forces = []
+    torques = []
+    points = []
+    dists = []
+    geom1 = []
+    geom2 = []
+    frames = []
+    offsets = [0]
+    for state, info in zip(states[1:], infos):
+        for row in state["contacts"]:
+            force = np.asarray(row["force_on_geom1_world"], dtype=float)
+            point = np.asarray(row["pos"], dtype=float)
+            geom1.append(str(row["geom1"]))
+            geom2.append(str(row["geom2"]))
+            forces.append(force)
+            points.append(point)
+            torques.append(np.cross(point - state["tcp_pos"], force))
+            dists.append(float(row["dist"]))
+            frames.append(np.asarray(row["frame"], dtype=float).reshape(-1))
+        offsets.append(len(forces))
+    empty3 = np.zeros((0, 3))
+    write_npz(
+        case_id,
+        t_state=np.array([row["episode_time"] for row in states], dtype=float),
+        tick=np.array([row["tick"] for row in states], dtype=int),
+        q=np.vstack([row["q"] for row in states]),
+        dq=np.vstack([row["dq"] for row in states]),
+        tcp_pos=np.vstack([row["tcp_pos"] for row in states]),
+        tcp_rot=np.stack([np.asarray(row["tcp_mat"], dtype=float).reshape(3, 3) for row in states]),
+        tcp_twist=np.vstack(twists),
+        tau_applied=np.vstack([row["tau_command"] for row in states[1:]]),
+        tau_raw=np.vstack([np.asarray(info["tau_raw"], dtype=float) for info in infos]),
+        tau_before=np.asarray(meta["tau_before"], dtype=float),
+        qpos0=np.asarray(meta["qpos0"], dtype=float),
+        qvel0=np.asarray(meta["qvel0"], dtype=float),
+        command=np.vstack(inputs["command"]),
+        p_ref=np.vstack([np.asarray(info["p_ref"], dtype=float) for info in infos]),
+        p_ref_before=np.vstack(inputs["p_ref_before"]),
+        r_ref=np.stack([np.asarray(info["r_ref"], dtype=float).reshape(3, 3) for info in infos]),
+        r_ref_before=np.stack(inputs["r_ref_before"]),
+        reference_correction_pos=np.vstack([np.asarray(info["reference_correction_pos"], dtype=float) for info in infos]),
+        v_ref=np.vstack([np.asarray(info["v_ref"], dtype=float) for info in infos]),
+        K=np.vstack([np.asarray(info["k"], dtype=float) for info in infos]),
+        D=np.vstack([np.asarray(info["d"], dtype=float) for info in infos]),
+        phase=np.array([str(info["phase_k"]) for info in infos]),
+        mode=np.array([str(info["control_mode"]) for info in infos]),
+        execution=np.array([str(info["execution"]) for info in infos]),
+        active_gear=np.array([str(info["active_gear"]) for info in infos]),
+        target_gear=np.array([str(info["target_gear"]) for info in infos]),
+        guard_status=np.array(inputs["guard_status"]),
+        wrench_raw=np.vstack([np.asarray(info["ft_raw_wrench_sensor"], dtype=float) for info in infos]),
+        wrench_compensated=np.vstack([np.asarray(info["ft_compensated_wrench_tcp"], dtype=float) for info in infos]),
+        external_wrench=np.vstack(inputs["external"]),
+        force_used=np.vstack(inputs["force_used"]),
+        pause_applied=np.asarray(inputs["pause"], dtype=np.int8),
+        saturation_flags=np.asarray(inputs["saturation"], dtype=np.int8),
+        blocked_now=np.asarray(inputs["blocked"], dtype=np.int8),
+        transition_active=np.asarray([1 if info["transition_active"] else 0 for info in infos], dtype=np.int8),
+        warnings=np.asarray([int(np.sum(row["warnings"])) for row in states[1:]], dtype=int),
+        first_fault_tick=np.int64(-1 if meta.get("first_fault_tick") is None else meta["first_fault_tick"]),
+        contact_force=np.vstack(forces) if forces else empty3,
+        contact_torque=np.vstack(torques) if torques else empty3,
+        contact_point=np.vstack(points) if points else empty3,
+        contact_dist=np.asarray(dists, dtype=float),
+        contact_geom1=np.asarray(geom1, dtype=str),
+        contact_geom2=np.asarray(geom2, dtype=str),
+        contact_frame=np.vstack(frames) if frames else np.zeros((0, 9)),
+        contact_offsets=np.asarray(offsets, dtype=int),
+    )
+    write_json(case_id, meta)
+    del scene, n
+    return np.vstack([row["tcp_pos"] for row in states]), np.array([row["episode_time"] for row in states])
+
+
+_GEAR_PEAKS = {}
 
 
 @pytest.mark.parametrize("case_id", physical_case_ids())
 def test_physical(case_id):
+    from feedingrobot.controllers.cartesian_impedance import control_step
+    from feedingrobot.controllers.v3spec import PHYSICAL, compare_scalar
+
     family, seed_s, variant = case_id.split("-")
     seed = int(seed_s[1:])
     cfg = load_m2_config()
@@ -427,83 +542,152 @@ def test_physical(case_id):
         scene_cfg = "configs/m1_scene.json"
     scene = FeedingScene(scene_cfg)
     pose = seed if family == "pause" else 0
-    state = place_arm(scene, scene.config["q_torque_poses"][pose], seed=seed)
+    place_arm(scene, scene.config["q_torque_poses"][pose], seed=seed)
+    hold = np.array(scene.data.qfrc_bias[scene.index.arm_dof_adr], dtype=float)
+    for _ in range(200):
+        scene.step_physics(hold)
+    qpos = scene.data.qpos.copy()
+    qvel = scene.data.qvel.copy()
     _apply_variant(scene, variant)
+    scene.data.qpos[:] = qpos
+    scene.data.qvel[:] = qvel
+    mujoco.mj_forward(scene.model, scene.data)
+    scene.tick = 0
+    scene.time_offset = float(scene.data.time)
+    state = scene.snapshot()
     bias = np.array(scene.data.qfrc_bias[scene.index.arm_dof_adr], dtype=float)
     ctl, guard = start_controller(scene, cfg, state, tau=np.zeros(7) if family == "takeover" else bias)
     ctl.power_on = family == "takeover"
-    origin = state["tcp_pos"].copy()
     release_at = None
-    release_pos = None
 
-    def twist(t, controller):
-        if family == "release" and 0.02 <= t < 0.08:
+    def twist(controller):
+        if family in {"release", "release_fast"} and getattr(controller, "_rel_phase", "push") == "push" and controller.sim_time >= 0.02:
             return np.array([0.05, 0, 0, 0, 0, 0])
         if family == "gear":
             mode = getattr(controller, "_gear_phase", "approach")
-            if mode == "backoff":
-                return np.array([0.0, 0.01, 0, 0, 0, 0])
-            if mode == "switched":
-                return np.zeros(6)
-            return np.array([0.0, -0.02, 0, 0, 0, 0])
+            if mode in {"press", "blend"}:
+                return np.array([0.0, -0.002, 0, 0, 0, 0])
+            if mode == "approach":
+                return np.array([0.0, -0.008, 0, 0, 0, 0])
         return np.zeros(6)
 
-    def hook(i, t, controller):
-        nonlocal release_at, release_pos
+    def hook(t, controller):
+        nonlocal release_at
         scene.clear_external_wrench()
         if family == "pause" and 0.05 <= t < 0.08:
             controller._pause_advance = True
             scene.set_external_wrench([4.0, 0, 0], [0, 0, 0], controller.scene.snapshot()["tcp_pos"])
-        elif family == "release" and 0.04 <= t < 0.1:
-            scene.set_external_wrench([-5.0, 0, 0], [0, 0, 0], controller.scene.snapshot()["tcp_pos"])
-        elif family == "release" and t >= 0.1 and release_at is None:
-            release_at = t
-            release_pos = controller.scene.snapshot()["tcp_pos"].copy()
+        elif family in {"release", "release_fast"}:
+            from feedingrobot.controllers.v3spec import RELEASE_FORCE_N, RELEASE_RAMP_S
+
+            phase = getattr(controller, "_rel_phase", "push")
+            if phase == "push" and controller.reference.blocked:
+                controller.set_command(np.zeros(6), controller.sim_time, controller.sim_time + 0.1, controller.phase)
+                if family == "release_fast":
+                    controller._rel_phase = "free"
+                    if release_at is None:
+                        release_at = t
+                else:
+                    controller._rel_phase = "ramp"
+                    controller._rel_block = t
+                phase = controller._rel_phase
+            if phase == "push" and t >= 0.04:
+                scene.set_external_wrench([-RELEASE_FORCE_N, 0, 0], [0, 0, 0], controller.scene.snapshot()["tcp_pos"])
+            elif phase == "ramp":
+                alpha = min(1.0, (t - controller._rel_block) / RELEASE_RAMP_S)
+                if alpha < 1.0:
+                    scene.set_external_wrench([-RELEASE_FORCE_N * (1.0 - alpha), 0, 0], [0, 0, 0], controller.scene.snapshot()["tcp_pos"])
+                elif release_at is None:
+                    controller._rel_phase = "free"
+                    release_at = t
         elif family == "wrench" and 0.05 <= t < 0.15:
             scene.set_external_wrench([1.0, 0, 0], [0, 0, 0], controller.scene.snapshot()["tcp_pos"])
         elif family == "gear":
-            contacted = any("spring_pad" in {row.get("geom1"), row.get("geom2")} for row in controller.scene.snapshot()["contacts"])
-            if contacted and getattr(controller, "_gear_phase", "approach") == "approach":
-                controller._gear_phase = "backoff"
-                controller._gear_t = t
-            if getattr(controller, "_gear_phase", "") == "backoff" and t >= controller._gear_t + 0.08:
-                controller._gear_phase = "switched"
+            normal = float(_bowl_force(controller.scene.snapshot()["contacts"])[1])
+            mode = getattr(controller, "_gear_phase", "approach")
+            if mode == "approach" and normal > 0.05:
+                controller._gear_phase = "press"
+                controller._press_t = t
+                controller.set_command(np.array([0.0, -0.002, 0, 0, 0, 0]), controller.sim_time, controller.sim_time + 0.1, controller.phase)
+            elif mode == "press" and t >= controller._press_t + 0.08 and normal >= 0.15:
+                controller._gear_phase = "blend"
                 controller.phase = "ACQUIRE"
-                controller.set_command(np.zeros(6), controller.sim_time, controller.sim_time + 0.1, "ACQUIRE")
+                controller.set_command(np.array([0.0, -0.002, 0, 0, 0, 0]), controller.sim_time, controller.sim_time + 0.1, "ACQUIRE")
 
-    duration = {"pause": 0.3, "release": 1.2, "gear": 1.2, "wrench": 0.3, "takeover": 0.3}[family]
-    samples = []
+    duration = PHYSICAL[family]["duration"]
     dt = scene.dt
     steps = int(round(duration / dt))
     publish = max(int(round(0.05 / dt)), 1)
-    from feedingrobot.controllers.cartesian_impedance import control_step
-
+    states = [scene.snapshot()]
+    twists = [_tcp_twist(scene)]
+    infos = []
+    inputs = {"command": [], "external": [], "force_used": [], "pause": [], "saturation": [], "blocked": [], "p_ref_before": [], "r_ref_before": [], "guard_status": []}
     for i in range(steps):
-        hook(i, ctl.sim_time, ctl)
+        cached = ctl.wrench._cache
+        inputs["force_used"].append(np.zeros(3) if cached is None else np.asarray(cached["compensated_wrench_tcp"][:3], dtype=float))
+        hook(ctl.sim_time, ctl)
+        inputs["pause"].append(1 if ctl._pause_advance else 0)
+        inputs["p_ref_before"].append(np.array(ctl.reference.p_ref, dtype=float).copy())
+        inputs["r_ref_before"].append(np.array(ctl.reference.r_ref, dtype=float).reshape(3, 3).copy())
+        applied = np.zeros(6)
+        if scene.applied_wrench is not None:
+            applied = np.concatenate([np.asarray(scene.applied_wrench["force"], dtype=float), np.asarray(scene.applied_wrench["torque"], dtype=float)])
+        inputs["external"].append(applied)
         if i % publish == 0 and guard.status == "RUNNING" and not ctl.power_on:
-            ctl.set_command(twist(ctl.sim_time, ctl), ctl.sim_time, ctl.sim_time + 0.1, ctl.phase)
+            ctl.set_command(twist(ctl), ctl.sim_time, ctl.sim_time + 0.1, ctl.phase)
         state, info = control_step(ctl, guard)
-        if "p_ref" not in info:
-            break
-        samples.append((state, info))
-        if guard.status == "ABORTED":
-            break
+        inputs["command"].append(np.asarray(info.get("twist_command", np.zeros(6)), dtype=float))
+        inputs["saturation"].append(1 if info.get("saturated_latched") else 0)
+        inputs["blocked"].append(1 if info.get("blocked_now") else 0)
+        inputs["guard_status"].append(str(guard.status))
+        states.append(state)
+        twists.append(_tcp_twist(scene))
+        infos.append(info)
     assert guard.failure is None, guard.failure
-    assert len(samples) >= 2
-    t, dq, tau, tcp, pref = _record_physical(case_id, samples, dt)
-    assert np.max(np.abs(dq)) <= 0.5 + 1e-9
-    assert np.max(np.abs(np.diff(tau, axis=0))) <= 2000.0 * dt + 1e-9
-    assert np.max(np.linalg.norm(pref - tcp, axis=1)) <= 0.02 + 1e-9
+    assert len(infos) == steps
+    meta = {
+        "dt": float(scene.model.opt.timestep),
+        "iterations": int(scene.model.opt.iterations),
+        "tolerance": float(scene.model.opt.tolerance),
+        "seed": seed,
+        "pose_id": pose,
+        "variant": variant,
+        "tau_before": np.zeros(7) if family == "takeover" else bias,
+        "qpos0": qpos,
+        "qvel0": qvel,
+        "unload": "fast" if family == "release_fast" else ("slow" if family == "release" else None),
+    }
+    if family in {"release", "release_fast"}:
+        meta["blocked_seen"] = any(flag > 0.5 for flag in inputs["blocked"])
+    tcp, times = _record_physical(case_id, scene, states, twists, infos, inputs, meta)
+    assert np.max(np.abs(np.vstack([row["dq"] for row in states]))) <= 0.5 + 1e-9
+    tau = np.vstack([row["tau_command"] for row in states[1:]])
+    assert np.max(np.abs(tau[0] - meta["tau_before"])) <= 2000.0 * dt + 1e-6
+    assert np.max(np.abs(np.diff(tau, axis=0))) <= 2000.0 * dt + 1e-6
+    pref = np.vstack([np.asarray(info["p_ref"], dtype=float) for info in infos])
+    assert np.max(np.linalg.norm(pref - tcp[:-1], axis=1)) <= 0.02 + 1e-9
     if family == "gear":
-        assert any("spring_pad" in {c["geom1"], c["geom2"]} for row in samples for c in row[0]["contacts"])
-    if family == "release":
+        normals = []
+        for row in states[1:]:
+            normals.append(float(_bowl_force(row["contacts"])[1]))
+        peak = float(np.max(normals)) if normals else 0.0
+        assert peak > 0.1
+        _GEAR_PEAKS[(seed, variant)] = peak
+        other = _GEAR_PEAKS.get((seed, "A"))
+        if variant in {"B", "C"} and other is not None:
+            assert compare_scalar("contact_force", other, peak, 0.1, 0.02) is None
+        assert any(str(info["phase_k"]) == "ACQUIRE" for info in infos)
+    if family in {"release", "release_fast"}:
+        assert any(flag > 0.5 for flag in inputs["blocked"])
         assert release_at is not None
-        speed = np.linalg.norm(np.diff(tcp, axis=0), axis=1) / np.diff(t)
-        speed_t = t[1:]
+        speed = np.linalg.norm(np.diff(tcp, axis=0), axis=1) / np.diff(times)
+        speed_t = times[1:]
         window = (speed_t >= release_at) & (speed_t <= release_at + 0.5)
         assert np.max(speed[window]) <= 0.03 + 1e-9
-        extra = tcp[(t >= release_at) & (t <= release_at + 0.5), 0] - release_pos[0]
-        assert np.max(extra) <= 0.005 + 1e-9
         stable = (speed_t >= release_at + 0.8) & (speed_t <= release_at + 1.0)
-        assert np.max(speed[stable]) <= 0.03 + 1e-9
-    del origin
+        assert np.max(speed[stable]) <= 0.005 + 1e-9
+    if family == "wrench":
+        loaded = [info for info, row in zip(infos, inputs["external"]) if abs(row[0]) > 0.5]
+        assert loaded
+        assert max(abs(float(np.asarray(info["ft_compensated_wrench_tcp"])[0])) for info in loaded) > 0.5
+
