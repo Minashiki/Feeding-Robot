@@ -121,6 +121,14 @@ class Guard:
         if self.status in {"STOPPING", "STOPPED"} and self._stop_since is None:
             self._stop_since = float(fault["time"])
 
+    def request_stop(self, tick: int, time: float, phase: str) -> None:
+        """An explicit stop is an event, not a fabricated sensor failure."""
+        if self.status != "RUNNING":
+            return
+        self.status = "STOPPING"
+        self._stop_since = float(time)
+        self.events.append({"kind": "stop_request", "tick": int(tick), "time": float(time), "phase": phase})
+
     def observe(self, state: dict, phase: str, control_info: dict | None = None, measurement: dict | None = None) -> None:
         self.phase = phase
         info = control_info or {}
@@ -133,6 +141,14 @@ class Guard:
         geoms = None
         if not state.get("finite", True) or not np.all(np.isfinite(state.get("q", [0]))) or not np.all(np.isfinite(state.get("dq", [0]))):
             reason = "non-finite"
+            self.status = "ABORTED"
+        elif measurement is not None and (
+            not measurement.get("finite", False)
+            or not np.all(np.isfinite(measurement.get("raw_wrench_sensor", [])))
+            or not np.all(np.isfinite(measurement.get("compensated_wrench_tcp", [])))
+        ):
+            reason = "non-finite-wrench"
+            measured = "wrench"
             self.status = "ABORTED"
         elif sum(state.get("warnings") or []) > 0:
             reason = "warning"

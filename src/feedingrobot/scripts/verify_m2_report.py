@@ -11,6 +11,17 @@ from feedingrobot.sim.model import repo_root
 
 
 def assess_m2(run: Path, scope: str, check_workspace: bool) -> dict:
+    try:
+        header = json.loads((run / "run.json").read_text())
+    except (OSError, ValueError):
+        header = {}
+    if header.get("schema_version") == "m2-full-v1":
+        from feedingrobot.controllers.full_acceptance import evaluate
+        verdict = evaluate(run, check_workspace=check_workspace, calibration=header.get("stage") == "calibration")
+        if scope != "full" or header.get("stage") != "full":
+            verdict["scope_passed"] = verdict["m3_ready"] = False
+            verdict["reasons"].append({"code":"full_scope_required"})
+        return verdict
     return verify_finished_report(run, scope, check_workspace)
 
 
@@ -44,6 +55,8 @@ def main():
         )
     )
     if args.scope == "fixes-v6" and verdict.get("scope_passed") and verdict["m3_ready"] is False:
+        return
+    if args.scope == "full" and verdict.get("scope_passed") and verdict["m3_ready"] is True:
         return
     raise SystemExit(1)
 

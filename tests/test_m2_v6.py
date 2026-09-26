@@ -449,6 +449,9 @@ def _trace(case_id):
     del kind
     scene = FeedingScene("configs/m1_scene.json")
     cfg = load_m2_config()
+    # These files exercise the archived V6 evidence format, whose stop law is frozen at 1.
+    cfg["stop"]["damping_nm_s_per_rad"] = 1.0
+    cfg["power_on_damping_scale"] = 1.0
     if name in {"upper", "lower"}:
         q = np.array(scene.config["q_torque_poses"][0], dtype=float)
         q[0] = scene.model.jnt_range[scene.index.arm_joint_ids[0], 1] - 0.04 if name == "upper" else scene.model.jnt_range[scene.index.arm_joint_ids[0], 0] + 0.04

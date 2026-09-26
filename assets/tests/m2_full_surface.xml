@@ -1,0 +1,12 @@
+<mujoco model="M2 full fixed mount spring fixture">
+  <include file="../scenes/feeding_p0.xml"/>
+  <worldbody>
+    <body name="test_mount" pos="0.778 -0.14 0.554">
+      <body name="spring_slider">
+        <inertial pos="0 0 0" mass="0.1" diaginertia="0.0002 0.0002 0.0002"/>
+        <joint name="spring_slide" type="slide" axis="0 -1 0" range="0 0.02" stiffness="500" damping="14.1421356237"/>
+        <geom name="spring_pad" type="box" size="0.035 0.004 0.035" pos="0 -0.004 0" mass="0" friction="0.5 0.005 0.0001" solref="0.005 1" solimp="0.9 0.95 0.001"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

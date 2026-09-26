@@ -64,12 +64,14 @@ class CartesianImpedance:
         self.rho_stop = float(config["rho_stop"])
         self.kq = float(config["posture"]["kq"])
         self.dq_gain = float(config["posture"]["dq"])
+        self.stop_damping = float(config["stop"]["damping_nm_s_per_rad"])
         self.posture_limit = float(config["posture"]["tau_limit"])
         self.rate = float(config["tau_rate_nm_s"])
         self.speed_predict = float(config["joint_speed_predict_rad_s"])
         self.margin_slow = float(config["joint_margin_slow_rad"])
         self.margin_stop = float(config["joint_margin_stop_rad"])
         self.power_on_limit = float(config["power_on_s"])
+        self.power_on_damping_scale = float(config.get("power_on_damping_scale", 1.0))
         self.blend_s = float(config["gain_blend_s"])
         self.hybrid = dict(config.get("hybrid_normal_force", {"enabled": False}))
         ids = self.index.arm_actuator_ids
@@ -137,6 +139,10 @@ class CartesianImpedance:
         if self.guard is not None:
             self.guard.reset()
         self._seed_wrench(state)
+        if self.guard is not None:
+            self.guard.observe(state, phase, measurement=self.wrench._cache)
+            if phase in {"STOP", "RECOVER"}:
+                self.guard.request_stop(state["tick"], self.sim_time, phase)
 
     def now(self) -> float:
         return float(self.data.time - self.scene.time_offset)
@@ -187,6 +193,10 @@ class CartesianImpedance:
             return {"accepted": False, "rejected": "fault"}
         if rejected is not None:
             return {"accepted": False, "rejected": rejected}
+        if self.guard is not None and self.guard.status != "RUNNING":
+            if phase in {"STOP", "RECOVER"} and self.guard.status in {"STOPPING", "STOPPED"}:
+                return {"accepted": True, "rejected": None, "idempotent": True}
+            return {"accepted": False, "rejected": "stopped"}
         stamp = float(command_time)
         payload = {
             "twist": twist.copy(),
@@ -205,6 +215,9 @@ class CartesianImpedance:
         self._command = payload
         self._last_stamp = stamp
         self.phase = phase
+        if phase in {"STOP", "RECOVER"} and self.guard is not None:
+            self.guard.request_stop(int(self.scene.tick), now, phase)
+            self._command = None
         return {"accepted": True, "rejected": None, "idempotent": False}
 
     def _vector_gain(self, gear: str) -> np.ndarray:
@@ -317,6 +330,8 @@ class CartesianImpedance:
         dq = np.asarray(state["dq"], dtype=float).reshape(_ARM)
         if self.guard is not None and self.guard.status == "ABORTED":
             return np.zeros(_ARM), {"apply": False, "status": "ABORTED", "phase_k": self.phase, "gear": "STOP"}
+        if self.guard is not None and self.phase in {"STOP", "RECOVER"}:
+            self.guard.request_stop(int(state["tick"]), self.sim_time, self.phase)
         mujoco.mj_forward(self.model, self.data)
         jacobian, bias = self._jacobian()
         mass = self._mass()
@@ -368,10 +383,6 @@ class CartesianImpedance:
                 self.guard.status = "STOPPING"
             self.power_on = False
             stopping = self.guard.status in {"STOPPING", "STOPPED"}
-        if stopping and not self._stop_anchored:
-            self.reference.reanchor(self._tcp_pos, self._tcp_rot)
-            self._stop_anchored = True
-            self._command = None
         active_cmd = self._command
         expired = False
         twist = np.zeros(6)
@@ -379,7 +390,7 @@ class CartesianImpedance:
             expired = True
             self._command = None
             if self.guard is not None and self.guard.failure is None:
-                self.guard.latch(
+                self.guard.begin_stop(
                     {
                         "tick": int(state["tick"]),
                         "time": self.sim_time,
@@ -394,6 +405,12 @@ class CartesianImpedance:
             stopping = True
         elif active_cmd is not None and self.sim_time < active_cmd["valid_until"] - 1e-12:
             twist = active_cmd["twist"].copy()
+        if stopping:
+            self.power_on = False
+            self._command = None
+            if not self._stop_anchored:
+                self.reference.reanchor(self._tcp_pos, self._tcp_rot)
+                self._stop_anchored = True
         if self.power_on or stopping or (self.guard is not None and self.guard.failure is not None):
             twist = np.zeros(6)
         if stopping:
@@ -404,6 +421,7 @@ class CartesianImpedance:
             self._blend = 1.0
         else:
             self._update_gains(dt)
+        effective_d = self._d * (self.power_on_damping_scale if self.power_on else 1.0)
         limits = self.effective_limits()
         if stopping:
             for key in ("v", "w", "a", "alpha"):
@@ -450,7 +468,7 @@ class CartesianImpedance:
             tau_posture = np.zeros(_ARM)
             null_term = np.zeros(_ARM)
         else:
-            wrench_c = self._k * e + self._d * (shaped["v_ref"] - v_actual)
+            wrench_c = self._k * e + effective_d * (shaped["v_ref"] - v_actual)
             if self.hybrid.get("enabled"):
                 wrench_c = self._hybrid(wrench_c, state)
             tau_posture = np.clip(self.kq * (self.reference.q0 - q) - self.dq_gain * dq, -self.posture_limit, self.posture_limit)
@@ -458,7 +476,7 @@ class CartesianImpedance:
                 tau_posture *= cmd_scale
             null_term = null.T @ tau_posture
         if stopping:
-            tau_raw = bias - self.dq_gain * dq
+            tau_raw = bias - self.stop_damping * dq
             null_term = np.zeros(_ARM)
             tau_posture = np.zeros(_ARM)
             wrench_c = np.zeros(6)
@@ -511,7 +529,7 @@ class CartesianImpedance:
             "r_ref": shaped["r_ref"],
             "v_ref": shaped["v_ref"],
             "k": self._k.copy(),
-            "d": self._d.copy(),
+            "d": effective_d.copy(),
             "rho": rho,
             "lam2": lam2,
             "scale": shaped["scale"],
@@ -622,16 +640,18 @@ class CartesianImpedance:
         return pose @ wrench_c + np.concatenate([-normal * force, np.zeros(3)])
 
 
-def control_step(controller: CartesianImpedance, guard, phase: str | None = None):
+def control_step(controller: CartesianImpedance, guard, phase: str | None = None, *, hold_driver: bool = False):
     """One control interval: compute from the current state, then step physics, then observe."""
     state = controller.scene.snapshot()
+    if not np.all(np.isfinite(state["raw_wrench_sensor"])):
+        controller._abort_input("non-finite-wrench", controller.now())
     if phase is not None and (guard.failure is None) and controller.guard.status == "RUNNING" and not controller.power_on:
         controller.phase = phase
     was_power_on = bool(controller.power_on)
     tau, info = controller.compute(state, controller.scene.dt)
     if not info.get("apply", True):
         return state, info
-    nxt = controller.scene.step_physics(tau)
+    nxt = controller.scene.step_physics(tau, hold_driver=hold_driver)
     measured = controller.wrench.measure(
         controller.model,
         controller.data,

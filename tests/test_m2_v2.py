@@ -535,6 +535,9 @@ def test_physical(case_id):
     family, seed_s, variant = case_id.split("-")
     seed = int(seed_s[1:])
     cfg = load_m2_config()
+    # Historical evidence-format regression. Full-v1 has its own physical matrix/profile.
+    cfg["stop"]["damping_nm_s_per_rad"] = 1.0
+    cfg["power_on_damping_scale"] = 1.0
     if family == "gear":
         scene_cfg = json_scene_spring()
         cfg = dict(cfg)
@@ -691,4 +694,3 @@ def test_physical(case_id):
         loaded = [info for info, row in zip(infos, inputs["external"]) if abs(row[0]) > 0.5]
         assert loaded
         assert max(abs(float(np.asarray(info["ft_compensated_wrench_tcp"])[0])) for info in loaded) > 0.5
-

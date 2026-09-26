@@ -1,0 +1,307 @@
+"""Physical M2 cases, all executed through the public torque-control step."""
+from __future__ import annotations
+
+import copy
+import json
+import os
+from pathlib import Path
+
+import mujoco
+import numpy as np
+
+from feedingrobot.controllers.cartesian_impedance import CartesianImpedance, control_step
+from feedingrobot.controllers.guard import Guard
+from feedingrobot.controllers.so3 import orientation_error, so3_exp
+from feedingrobot.controllers.full_spec import Case, VARIANTS
+from feedingrobot.sim.scene import FeedingScene
+from feedingrobot.sim.model import load_config
+
+
+def smooth(t, duration):
+    u = np.clip(t / duration, 0., 1.)
+    return float(10*u**3 - 15*u**4 + 6*u**5)
+
+
+def tcp_twist(scene):
+    velocity = np.zeros(6)
+    mujoco.mj_objectVelocity(scene.model, scene.data, mujoco.mjtObj.mjOBJ_SITE,
+                           scene.index.site_ids["tcp"], velocity, 0)
+    return np.r_[velocity[3:], velocity[:3]]
+
+
+def _ik_reset(scene, position, rotation):
+    """Bounded deterministic reset-only IK; never used during an episode."""
+    ids, cols = scene.index.arm_qpos_adr, scene.index.arm_dof_adr
+    ranges = scene.model.jnt_range[scene.index.arm_joint_ids]
+    for _ in range(300):
+        mujoco.mj_forward(scene.model, scene.data)
+        state = scene.snapshot()
+        error = np.r_[position - state["tcp_pos"], orientation_error(rotation, state["tcp_mat"])]
+        if np.linalg.norm(error) < 1e-8:
+            return
+        jp, jr = np.zeros((3, scene.model.nv)), np.zeros((3, scene.model.nv))
+        mujoco.mj_jacSite(scene.model, scene.data, jp, jr, scene.index.site_ids["tcp"])
+        jac = np.vstack([jp[:, cols], jr[:, cols]])
+        delta = jac.T @ np.linalg.solve(jac @ jac.T + 1e-5*np.eye(6), error)
+        scene.data.qpos[ids] = np.clip(scene.data.qpos[ids] + np.clip(delta, -.03, .03), ranges[:, 0]+.02, ranges[:, 1]-.02)
+    raise RuntimeError("reset IK did not converge")
+
+
+def prepare(case: Case, seed: int, controller_config: dict):
+    cfg = copy.deepcopy(controller_config)
+    scene_cfg = load_config("configs/m1_scene.json")
+    fixture = case.fixture
+    if fixture:
+        scene_cfg["model"] = "assets/tests/m2_full_wall.xml" if case.family == "wall" else "assets/tests/m2_full_surface.xml"
+        cfg["press_test"] = True
+    scene = FeedingScene(scene_cfg)
+    preset = "food_on_spoon" if case.family == "carry" or case.context == "food" else "near_mouth" if case.family == "mouth" else "food_on_plate"
+    state = scene.reset(seed=seed, preset=preset, settle_steps=0)
+    if case.family not in {"carry", "plate", "mouth"} and case.context != "food":
+        q = np.array(scene.config["q_torque_poses"][case.pose % 3], dtype=float)
+        if case.pose >= 3:
+            q[6] += np.pi / 2
+        q += np.random.default_rng(seed).uniform(-.01, .01, 7)
+        scene.data.qpos[scene.index.arm_qpos_adr] = q
+    if case.family == "mouth":
+        _ik_reset(scene, np.array([.518, .12, .336]), state["tcp_mat"])
+    mujoco.mj_forward(scene.model, scene.data)
+    if case.family == "plate":
+        _ik_reset(scene, np.array([.49, -.22, .030]), so3_exp(np.array([0., .5, 0.])) @ state["tcp_mat"])
+    if case.event == "singularity":
+        from feedingrobot.controllers.v6checks import SINGULAR_Q, REST_DQ
+        scene.data.qpos[scene.index.arm_qpos_adr] = SINGULAR_Q
+        scene.data.qvel[scene.index.arm_dof_adr] = REST_DQ
+        mujoco.mj_forward(scene.model,scene.data)
+        scene.last_tau[:] = scene.data.qfrc_bias[scene.index.arm_dof_adr]
+    if fixture:
+        mount = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY, "test_mount")
+        bowls = [mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in cfg["contact"]["bowl_geoms"]]
+        bottom = bowls[0]
+        front = bowls[-1]
+        normal = scene.data.geom_xpos[front] - scene.data.geom_xpos[bottom]
+        normal[2] = 0.
+        normal /= np.linalg.norm(normal)
+        leading = max(scene.data.geom_xpos[i] @ normal + np.abs(normal @ scene.data.geom_xmat[i].reshape(3, 3)) @ scene.model.geom_size[i] for i in bowls)
+        scene.model.body_pos[mount] = scene.data.geom_xpos[bottom] + normal*(leading - scene.data.geom_xpos[bottom] @ normal + .0015)
+        angle = np.arctan2(normal[0], -normal[1])
+        scene.model.body_quat[mount] = [np.cos(angle/2), 0., 0., np.sin(angle/2)]
+        scene.fixture_normal = normal
+        slide = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_JOINT, "spring_slide")
+        stiffness = case.stiffness if case.family == "spring" else 500.
+        scene.model.jnt_stiffness[slide] = stiffness
+        scene.model.dof_damping[scene.model.jnt_dofadr[slide]] = 2*np.sqrt(stiffness*.1)
+        if case.family == "wall":
+            scene.model.jnt_range[slide] = [0., 1e-6]
+    if case.family in {"stiffness", "press"}:
+        cfg["gears"]["FREE"]["kp"] = case.stiffness
+    cfg["delay_s"] = case.delay
+    cfg["noise"]["enable"] = case.noise
+    cfg["noise"]["seed"] = seed * 10 + (int(case.event[-1]) if case.event.startswith("sensor") else 0)
+    mujoco.mj_forward(scene.model, scene.data)
+    state = scene.snapshot()
+    if scene._illegal():
+        raise RuntimeError(f"illegal initial state: {case.key}, seed={seed}")
+    ctl = CartesianImpedance(scene, cfg)
+    guard = Guard(cfg, cfg["joint_speed_limit_rad_s"])
+    ctl.guard = guard
+    ctl.reset(state, np.zeros(7))
+    # One A-timebase settlement is shared by all variants. Hold cases explicitly test takeover from zero.
+    if case.family != "hold" and case.event != "singularity":
+        for k in range(1000):
+            if k % 50 == 0:
+                ctl.set_command(np.zeros(6), ctl.now(), ctl.now()+.1, "TRANSPORT")
+            state, info = control_step(ctl, guard, hold_driver=case.family == "mouth")
+            if guard.failure:
+                raise RuntimeError(f"settlement fault {case.key}: {guard.failure}")
+    snapshot = {name: np.array(getattr(scene.data, name), copy=True) for name in ("qpos", "qvel", "act", "ctrl", "qacc_warmstart")}
+    snapshot["time"] = float(scene.data.time)
+    snapshot["tau"] = scene.last_tau.copy()
+    return scene, cfg, snapshot
+
+
+def target(case, t):
+    """Six-dimensional displacement from the frozen start reference."""
+    x = np.zeros(6)
+    if case.family == "step":
+        x[case.axis] = case.sign * (.01 if case.axis < 3 else np.deg2rad(5)) * smooth(t-1., 1.)
+    elif case.family in {"circle", "loaded_circle"}:
+        u = np.clip(t-1., 0., 8.)
+        x[:2] = [.01*(np.cos(2*np.pi*u/4)-1), .01*np.sin(2*np.pi*u/4)]
+    elif case.family == "sine":
+        u = np.clip(t-1., 0., 8.)
+        x[3+case.axis] = np.deg2rad(3)*np.sin(2*np.pi*u/4)
+    elif case.family in {"spring", "press"}:
+        distance = .0065
+        u = t-1.
+        x[1] = -min(max(u, 0.)*.002, distance) + min(max(u-5.25, 0.)*.002, distance)
+    elif case.family == "carry":
+        x[0] = .01*(smooth(t-1., 1.)-smooth(t-4., 1.))
+    elif case.family == "plate":
+        x[2] = -.008*(smooth(t-1., 12.)-smooth(t-15., 12.))
+    elif case.family == "mouth":
+        x[0] = .006*(smooth(t-1., 12.)-smooth(t-15., 12.))
+    return x
+
+
+def command(case, t):
+    if case.family == "wall":
+        return np.array([0, -.02 if 1. <= t < 3. else 0., 0, 0, 0, 0])
+    if case.family == "stop":
+        x = np.zeros(6)
+        if .8 <= t < 1.42:
+            x[case.axis] = case.sign * (.04 if case.axis < 3 else .2)
+        return x
+    return (target(case, t+.05) - target(case, t))/.05
+
+
+def run_variant(case, seed, variant, scene, cfg, initial):
+    for name, value in initial.items():
+        if name not in {"time", "tau"}:
+            getattr(scene.data, name)[:] = value
+    scene.data.time = initial["time"]
+    scene._clear_python_state()
+    scene.time_offset = initial["time"]
+    scene.dt, scene.model.opt.iterations, scene.model.opt.tolerance = VARIANTS[variant]
+    scene.model.opt.timestep = scene.dt
+    scene.data.xfrc_applied[:] = 0
+    scene.data.qfrc_applied[:] = 0
+    mujoco.mj_forward(scene.model, scene.data)
+    ctl = CartesianImpedance(scene, cfg)
+    guard = Guard(cfg, cfg["joint_speed_limit_rad_s"])
+    ctl.guard = guard
+    ctl.reset(scene.snapshot(), initial["tau"])
+    initial_measurement = ctl.wrench._cache
+    state = scene.snapshot()
+    origin = state["tcp_pos"].copy()
+    rotation = state["tcp_mat"].copy()
+    states, infos, external, supplied = [state], [], [], []
+    velocities = [tcp_twist(scene)]
+    physical_dq = [scene.data.qvel[scene.index.arm_dof_adr].copy()]
+    fixture_rows, timing = [], []
+    import time
+    snapshot_fn = scene.snapshot
+    fault_tick = round(1.42 / scene.dt) + 1
+    def injected_snapshot():
+        s = snapshot_fn()
+        if case.family == "stop" and scene.tick == fault_tick:
+            if case.event in {"nan", "inf"}:
+                s["raw_wrench_sensor"][0] = np.nan if case.event == "nan" else np.inf
+            elif case.event == "warning":
+                s["warnings"][0] = 1
+            elif case.event in {"contact", "penetration"}:
+                s["contacts"].append({"geom1": "tool_handle", "geom2": "plate_bottom", "geom1_id": mujoco.mj_name2id(scene.model,mujoco.mjtObj.mjOBJ_GEOM,"tool_handle"), "geom2_id": mujoco.mj_name2id(scene.model,mujoco.mjtObj.mjOBJ_GEOM,"plate_bottom"), "frame": np.eye(3).ravel(), "force_contact": np.zeros(3), "group1": "spoon", "group2": "plate", "dist": -.002 if case.event == "penetration" else 0., "force_on_geom2_world": np.zeros(3), "force_on_geom1_world": np.zeros(3), "pos": s["tcp_pos"].copy()})
+        if case.family == "stop" and case.event == "speed" and fault_tick <= scene.tick <= round(1.422/scene.dt):
+            s["dq"][0] = .51
+        return s
+    scene.snapshot = injected_snapshot
+    try:
+        for k in range(round(case.duration/scene.dt)):
+            t = k*scene.dt
+            scene.clear_external_wrench()
+            force = np.zeros(6)
+            point = snapshot_fn()["tcp_pos"].copy()
+            if case.family == "static" and t >= 1.:
+                force[case.axis] = case.sign * case.load
+                if case.event == "lever":
+                    point[0] += .03
+            elif case.family in {"stiffness", "loaded_circle"} and t >= 1.:
+                force[case.axis] = case.sign * case.load
+            elif case.family == "pulse" and 1.5 <= t < 1.65:
+                force[case.axis] = case.sign * (1. if case.axis < 3 else .02)
+            elif case.family == "stop" and case.event == "wrench" and abs(t-1.42) < scene.dt/2:
+                force[0] = 8.1
+            if np.any(force):
+                scene.set_external_wrench(force[:3], force[3:], point)
+            if k % round(.05/scene.dt) == 0 and guard.status == "RUNNING":
+                if not (case.family == "stop" and t >= 1.4-1e-10):
+                    phase = "ACQUIRE" if case.family == "plate" and 0.5 <= t < 28. else "APPROACH" if case.family == "mouth" else "TRANSPORT"
+                    requested = command(case, t)
+                    if case.fixture:
+                        requested[:3] = -requested[1] * scene.fixture_normal
+                    ctl.set_command(requested, ctl.now(), ctl.now()+.1, phase)
+            if case.family == "stop" and abs(t-1.4) < scene.dt/2:
+                requested = command(case, t)
+                if case.fixture:
+                    requested[:3] = -requested[1] * scene.fixture_normal
+                ctl.set_command(requested, ctl.now(), ctl.now()+.02 if case.event == "expired" else ctl.now()+.1, "TRANSPORT")
+            if case.family == "stop" and abs(t-1.42) < scene.dt/2 and case.event in {"STOP", "RECOVER"}:
+                ctl.set_command(np.zeros(6), ctl.now(), ctl.now()+.1, case.event)
+            if case.family == "wall":
+                aid = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "test_retract_driver")
+                scene.data.ctrl[aid] = .04 * smooth(t-3., .5)
+            supplied.append(np.zeros(6) if ctl._command is None else ctl._command["twist"].copy())
+            external.append(np.r_[force, point])
+            started = time.perf_counter()
+            state, info = control_step(ctl, guard, hold_driver=case.family == "mouth")
+            timing.append(time.perf_counter()-started)
+            if not info["apply"]:
+                supplied.pop(); external.pop(); timing.pop()
+                break
+            states.append(state); infos.append(info); velocities.append(tcp_twist(scene))
+            physical_dq.append(scene.data.qvel[scene.index.arm_dof_adr].copy())
+            if case.fixture:
+                jid = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_JOINT, "spring_slide")
+                rjid = mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_JOINT, "test_retract")
+                qa, da = scene.model.jnt_qposadr[jid], scene.model.jnt_dofadr[jid]
+                retract = [0., 0., 0.]
+                if rjid >= 0:
+                    ra, rd = scene.model.jnt_qposadr[rjid], scene.model.jnt_dofadr[rjid]
+                    retract = [scene.data.qpos[ra], scene.data.qvel[rd], scene.data.qacc[rd]]
+                fixture_rows.append([scene.data.qpos[qa], scene.data.qvel[da], scene.data.qacc[da], *retract])
+            if guard.status == "ABORTED":
+                break
+    finally:
+        scene.snapshot = snapshot_fn
+    n = len(infos)
+    arrays = {key: np.array([s[key] for s in states]) for key in ("q", "dq", "tcp_pos", "tcp_mat", "food_pos", "food_quat", "raw_wrench_sensor", "qfrc_actuator", "warnings", "finite")}
+    arrays.update({key: np.array([i[key] for i in infos]) for key in (
+        "p_ref", "r_ref", "v_ref", "twist_command", "twist_limited", "tau_cmd", "tau_raw", "tau_bias", "tau_task", "tau_null", "tau_before", "k", "d", "phase_k", "rho", "execution", "status", "power_on", "blocked", "reference_correction_pos",
+        "ft_compensated_wrench_tcp", "ft_delivered_wrench_tcp", "ft_estimated_kinematics", "ft_estimated_valid", "ft_valid", "ft_sample_time", "ft_sample_tick", "ft_filtered_wrench_tcp", "ft_tool_load_predicted", "ft_tcp_wrench_world", "ft_bias_wrench_tcp", "ft_tool_velocity", "ft_tool_com", "ft_tool_inertia", "ft_tcp_position")})
+    arrays["physical_dq"] = np.array(physical_dq)
+    arrays["initial_tool_velocity"] = initial_measurement["tool_velocity"]
+    arrays["initial_compensated"] = initial_measurement["compensated_wrench_tcp"]
+    arrays.update(t=np.arange(n+1)*scene.dt, tick=np.arange(n+1), tcp_twist=np.array(velocities), external=np.array(external), supplied=np.array(supplied), origin=origin, rotation=rotation, initial_qpos=initial["qpos"], initial_qvel=initial["qvel"], initial_tau=initial["tau"], fixture=np.array(fixture_rows).reshape(-1, 6), wall_seconds=np.array(timing))
+    arrays["age"] = np.array([np.nan if i["ft_age_s"] is None else i["ft_age_s"] for i in infos])
+    offsets, contacts = [0], []
+    for s in states[1:]:
+        contacts.extend(s["contacts"]); offsets.append(len(contacts))
+    arrays["contact_offsets"] = np.array(offsets)
+    for name in ("geom1", "geom2", "dist"):
+        arrays["contact_"+name] = np.array([c[name] for c in contacts], dtype=str if name != "dist" else float)
+    arrays["contact_force"] = np.array([c["force_on_geom2_world"] for c in contacts]).reshape(-1, 3)
+    for key, width in (("pos",3),("frame",9),("force_contact",3)):
+        arrays["contact_"+key] = np.array([c[key] for c in contacts]).reshape(-1,width)
+    for key in ("geom1_id","geom2_id"):
+        arrays["contact_"+key] = np.array([c[key] for c in contacts],dtype=int)
+    abort_probe = None
+    if guard.status == "ABORTED":
+        tick, now = scene.tick, scene.data.time
+        applied = [control_step(ctl,guard)[1]["apply"] for _ in range(3)]
+        abort_probe = {"tick_before":tick,"tick_after":scene.tick,"time_before":now,"time_after":scene.data.time,"apply":applied}
+    metadata = {**case.manifest(seed, variant), "fault": guard.failure, "events": guard.events,
+                "stopped_ok": guard.stopped_ok, "actual_duration": n*scene.dt, "abort_probe":abort_probe,
+                "effective_controller": cfg, "joint_ranges": ctl.ranges.tolist(),
+                "normal": scene.fixture_normal.tolist() if case.fixture else None,
+                "mount": scene.model.body_pos[mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY, "test_mount")].tolist() if case.fixture else None}
+    return arrays, metadata
+
+
+def run_group(case: Case, seed: int, config: dict, output: str | None = None):
+    scene, cfg, initial = prepare(case, seed, config)
+    results = []
+    for variant in VARIANTS:
+        arrays, metadata = run_variant(case, seed, variant, scene, cfg, initial)
+        if output is not None:
+            path = Path(output) / metadata["case_id"]
+            temporary = Path(str(path) + ".npz.partial")
+            with temporary.open("wb") as handle:
+                np.savez_compressed(handle, **arrays)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(str(path) + ".npz")
+            temporary = Path(str(path) + ".json.partial")
+            temporary.write_text(json.dumps(metadata, indent=2))
+            temporary.replace(str(path) + ".json")
+        results.append((arrays, metadata))
+    return results

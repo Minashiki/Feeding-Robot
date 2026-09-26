@@ -16,6 +16,7 @@
   "joint_margin_slow_rad": 0.1,
   "joint_margin_stop_rad": 0.05,
   "power_on_s": 1.0,
+  "power_on_damping_scale": 8.0,
   "gain_blend_s": 0.2,
   "filter_hz": 30.0,
   "delay_s": 0.0,
@@ -25,7 +26,7 @@
   "mouth_case": false,
   "noise": {"enable": false, "force_std": 0.02, "torque_std": 0.002, "seed": 0},
   "blocked": {"force_n": 0.3, "error_m": 0.002, "confirm_s": 0.01, "sat_s": 0.02, "dev_s": 0.1},
-  "stop": {"speed_rad_s": 0.02, "within_s": 0.5, "hold_s": 0.2},
+  "stop": {"speed_rad_s": 0.02, "within_s": 0.5, "hold_s": 0.2, "damping_nm_s_per_rad": 8.0},
   "wrench_limits": {"FREE": [8.0, 0.8], "ACQUIRE": [4.0, 0.4], "MOUTH": [2.0, 0.2], "STOP": [8.0, 0.8]},
   "hybrid_normal_force": {"enabled": false, "f_d": 0.5, "kf": 0.2, "ki": 0.0, "u_max": 2.0},
   "contact": {
