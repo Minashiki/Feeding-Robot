@@ -132,6 +132,7 @@ class ReferenceShaper:
         twist = np.asarray(twist, dtype=float).reshape(6)
         lin = np.zeros(3)
         ang = np.zeros(3)
+        candidate = np.zeros(6)
         blocked_now = False
         integrate = False
         envelope = dict(limits)
@@ -163,8 +164,9 @@ class ReferenceShaper:
                     if excess[i] > 0 and abs(lin[i]) > 1e-15:
                         room = self.box - abs(self.p_ref[i] - self.anchor[i])
                         lin[i] = np.sign(lin[i]) * max(room, 0.0) / dt
+            candidate = np.concatenate([lin, ang])
             if project is not None:
-                beta = float(np.clip(project(np.concatenate([lin, ang])), 0.0, 1.0))
+                beta = float(np.clip(project(candidate), 0.0, 1.0))
                 lin = lin * beta
                 ang = ang * beta
                 if beta <= 1e-15:
@@ -205,6 +207,7 @@ class ReferenceShaper:
             "reference_correction_rot": float(self.reference_correction_rot),
             "correction_reason": self.correction_reason,
             "beta": float(beta),
+            "candidate": np.asarray(candidate, dtype=float).copy(),
         }
 
     def _suppress(self, lin, ang, pos, rot, force, dt, limits, saturated, active):

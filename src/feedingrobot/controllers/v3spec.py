@@ -36,6 +36,8 @@ COMMAND_LIN_ZERO = 1e-4
 COMMAND_ANG_ZERO = 1e-4
 FORCE_ZERO = 1e-6
 TORQUE_ZERO = 1e-6
+RELEASE_SCORING_VERSION = "v6-staged"
+RAMP_FORCE_ATOL = 1e-6
 PHYSICAL = {
     "pause": {"duration": 0.3, "pose": "seed"},
     "release": {"duration": 2.5, "pose": 0},
@@ -86,6 +88,7 @@ STRUCTURAL = {
     "io_error",
 }
 ADVERSARIAL = (
+    "auto_resume",
     "bad_dtype_tick",
     "bad_offsets",
     "bad_rotation",
@@ -98,10 +101,12 @@ ADVERSARIAL = (
     "fast_ramp",
     "fast_skip",
     "fast_speed",
+    "fault_tick",
     "gain_huge",
     "gear_fake_free",
     "hash_stale",
     "input_changed",
+    "joint_projection",
     "k_nan",
     "manifest_drop",
     "manifest_dup",
@@ -120,7 +125,12 @@ ADVERSARIAL = (
     "release_speed",
     "release_two_frames",
     "run_incomplete",
+    "singularity_stop",
+    "slow_ramp_late",
+    "slow_spike",
     "solver_label",
+    "stop_speed",
+    "stop_torque",
     "teardown_fail",
 )
 
@@ -167,6 +177,10 @@ def _nums(value):
 
 
 def case_kind(case_id: str) -> str:
+    if case_id.startswith("V6-zero-j"):
+        return "v6zero"
+    if case_id.startswith("V6-zero-phys-") or case_id.startswith("V6-stop-"):
+        return "v6trace"
     family = case_id.split("-", 1)[0]
     if family in PHYSICAL and case_id.count("-") == 2:
         return "physical"
@@ -193,7 +207,7 @@ def evidence_paths() -> list[str]:
     ]
     for case_id in required_case_ids():
         kind = case_kind(case_id)
-        if kind == "physical":
+        if kind in {"physical", "v6trace"}:
             rows.extend((f"cases/{case_id}.npz", f"cases/{case_id}.json"))
         elif kind == "array":
             rows.append(f"cases/{case_id}.npz")
@@ -717,48 +731,6 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
             metrics["events"]["gain_complete"] = float(t_state[int(done)])
     if family != "gear" and np.any(target_norm > 0):
         _add(reasons, "event_missing", case_id, "unexpected_contact")
-    if family == "release":
-        idx = np.flatnonzero(blocked)
-        ext = np.linalg.norm(external[:, :3], axis=1)
-        cmd = np.linalg.norm(command[:, :3], axis=1)
-        if idx.size == 0:
-            _add(reasons, "event_missing", case_id, "blocked")
-        else:
-            metrics["events"]["blocked"] = float(t_state[int(idx[0])])
-            command_zero, wrench_zero = _zero_masks(command, external)
-            blocked_k = int(idx[0])
-            unload = np.flatnonzero((np.arange(n) > blocked_k) & command_zero)
-            zero = np.flatnonzero((np.arange(n) >= int(unload[0])) & wrench_zero) if unload.size else np.array([], dtype=int)
-            if unload.size == 0 or zero.size == 0:
-                _add(reasons, "event_missing", case_id, "release")
-            else:
-                unload_k = int(unload[0])
-                release_k = int(zero[0])
-                release_t = float(t_state[release_k])
-                metrics["events"]["release"] = release_t
-                check_release_tail(reasons, case_id, command, external, t_state, unload_k, release_k)
-                if "release_time" in meta and abs(float(meta["release_time"]) - release_t) > 1e-9:
-                    _add(reasons, "event_missing", case_id, "release_time", meta["release_time"], release_t)
-                if t_state[-1] < release_t + 1.0 - 1e-9:
-                    _add(reasons, "sample_count", case_id, "release_window")
-                speed = np.linalg.norm(twist[1:, :3], axis=1)
-                fd = np.linalg.norm(np.diff(tcp, axis=0), axis=1) / var["dt"]
-                times = t_state[1:]
-                half = (times >= release_t) & (times <= release_t + 0.5)
-                stable = (times >= release_t + 0.8) & (times <= release_t + 1.0)
-                if not np.any(half) or not np.any(stable):
-                    _add(reasons, "sample_count", case_id, "release_window")
-                elif np.any(speed[half] > 0.03 + 1e-9) or np.any(fd[half] > 0.03 + 1e-9):
-                    _add(reasons, "release_speed", case_id, "tcp_speed", float(np.max(speed[half])), 0.03)
-                extra = tcp[1:][half] - tcp[release_k]
-                if np.any(np.maximum(0.0, extra @ RELEASE_DIRECTION) > 0.005 + 1e-9):
-                    _add(reasons, "release_speed", case_id, "displacement")
-                stable = (times >= release_t + 0.8) & (times <= release_t + 1.0)
-                omega = np.linalg.norm(twist[1:, 3:], axis=1)
-                if np.any(speed[stable] > 0.005 + 1e-9) or np.any(omega[stable] > 0.05 + 1e-9):
-                    _add(reasons, "release_speed", case_id, "stable")
-                if np.any(cmd[(t_state[:-1] >= release_t) & (t_state[:-1] <= release_t + 1.0)] > 1e-4):
-                    _add(reasons, "release_speed", case_id, "command")
     if family == "wrench":
         loaded = np.linalg.norm(external[:, :3], axis=1) > 0.5
         if not np.any(loaded):
@@ -777,10 +749,8 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
     rebuilt = _rebuild_blocked(command, force_used, pref, tcp, var["dt"])
     if np.any(rebuilt & ~blocked):
         _add(reasons, "event_missing", case_id, "blocked_rebuild")
-    if family == "release" and not np.any(rebuilt):
-        _add(reasons, "event_missing", case_id, "blocked")
-    if family == "release_fast":
-        _score_fast_release(reasons, metrics, case_id, rebuilt, command, external, twist, tcp, t_state, var["dt"])
+    if family in {"release", "release_fast"}:
+        _score_release(reasons, metrics, case_id, family, rebuilt, command, external, twist, tcp, t_state, var["dt"], meta)
     return metrics
 
 
@@ -818,57 +788,197 @@ def check_release_tail(reasons, case_id, command, external, t_state, unload_k, z
         _add(reasons, code, case_id, f"{field}[{index}]", float(values[index]), limit, text=f"{code} t={float(t_state[index])}")
 
 
-def _score_fast_release(reasons, metrics, case_id, rebuilt, command, external, twist, tcp, t_state, dt):
+def _step_count(dt, seconds):
+    dt = float(dt)
+    steps = int(round(float(seconds) / dt))
+    if steps < 0 or abs(steps * dt - float(seconds)) > 1e-9:
+        return None
+    return steps
+
+
+def _window_fits(length, start, steps) -> bool:
+    return steps is not None and start >= 0 and start + steps < length
+
+
+def _first_over(values, limit):
+    bad = np.flatnonzero(np.asarray(values, dtype=float) > float(limit) + 1e-9)
+    if bad.size == 0:
+        return None
+    return int(bad[0])
+
+
+def _release_events(reasons, case_id, rebuilt, command, external):
     idx = np.flatnonzero(rebuilt)
     if idx.size == 0:
         _add(reasons, "event_missing", case_id, "blocked_first")
-        return
+        return None
     blocked_k = int(idx[0])
-    metrics["events"]["blocked_first"] = float(t_state[blocked_k])
     command_zero, wrench_zero = _zero_masks(command, external)
-    after = np.flatnonzero((np.arange(len(command)) > blocked_k) & command_zero)
-    if after.size == 0:
+    if blocked_k + 1 >= len(command) or not bool(command_zero[blocked_k + 1]):
         _add(reasons, "event_mismatch", case_id, "unload_start")
-        return
-    unload_k = int(after[0])
+        return None
+    unload_k = blocked_k + 1
+    if unload_k == 0 or bool(wrench_zero[unload_k - 1]):
+        _add(reasons, "event_mismatch", case_id, "early_unload")
+        return None
     zero = np.flatnonzero((np.arange(len(command)) >= unload_k) & wrench_zero)
     if zero.size == 0:
         _add(reasons, "event_mismatch", case_id, "force_zero")
+        return None
+    return blocked_k, unload_k, int(zero[0])
+
+
+def _check_transient(reasons, case_id, label, tcp, twist, t_state, dt, k0):
+    half = _step_count(dt, 0.5)
+    if not _window_fits(len(tcp), k0, half) or twist.shape[0] < len(tcp):
+        _add(reasons, "sample_count", case_id, label + "_window")
+        return None
+    speed = np.linalg.norm(twist[k0 : k0 + half + 1, :3], axis=1)
+    fd = np.linalg.norm(np.diff(tcp[k0 : k0 + half + 1], axis=0), axis=1) / float(dt)
+    extra = np.maximum(0.0, (tcp[k0 : k0 + half + 1] - tcp[k0]) @ RELEASE_DIRECTION)
+    if speed.size != half + 1 or fd.size != half:
+        _add(reasons, "sample_count", case_id, label + "_window")
+        return None
+    hit = _first_over(speed, 0.03)
+    if hit is not None:
+        index = k0 + hit
+        _add(reasons, "release_speed", case_id, label + "_speed", float(speed[hit]), 0.03, text=f"release_speed {label}_speed t={float(t_state[index])} index={index}")
+    else:
+        hit_fd = _first_over(fd, 0.03)
+        if hit_fd is not None:
+            index = k0 + hit_fd
+            _add(reasons, "release_speed", case_id, label + "_fd", float(fd[hit_fd]), 0.03, text=f"release_speed {label}_fd t={float(t_state[index])} index={index}")
+    hit_x = _first_over(extra, 0.005)
+    if hit_x is not None:
+        index = k0 + hit_x
+        _add(reasons, "release_speed", case_id, label + "_displacement", float(extra[hit_x]), 0.005, text=f"release_speed {label}_displacement t={float(t_state[index])} index={index}")
+    return {"speed": float(np.max(speed)), "fd": float(np.max(fd)) if fd.size else 0.0, "disp": float(np.max(extra))}
+
+
+def _check_stable(reasons, case_id, label, tcp, twist, t_state, dt, k0):
+    start = _step_count(dt, 0.8)
+    end = _step_count(dt, 1.0)
+    if not _window_fits(len(tcp), k0, end) or start is None or twist.shape[0] < len(tcp):
+        _add(reasons, "sample_count", case_id, label + "_stable_window")
+        return None
+    speed = np.linalg.norm(twist[k0 + start : k0 + end + 1, :3], axis=1)
+    omega = np.linalg.norm(twist[k0 + start : k0 + end + 1, 3:], axis=1)
+    fd = np.linalg.norm(np.diff(tcp[k0 + start : k0 + end + 1], axis=0), axis=1) / float(dt)
+    expect = end - start + 1
+    if speed.size != expect or omega.size != expect or fd.size != expect - 1:
+        _add(reasons, "sample_count", case_id, label + "_stable_window")
+        return None
+    hit = _first_over(speed, 0.005)
+    if hit is not None:
+        index = k0 + start + hit
+        _add(reasons, "release_speed", case_id, label + "_stable", float(speed[hit]), 0.005, text=f"release_speed {label}_stable t={float(t_state[index])} index={index}")
+    else:
+        hit_fd = _first_over(fd, 0.005)
+        if hit_fd is not None:
+            index = k0 + start + hit_fd
+            _add(reasons, "release_speed", case_id, label + "_fd", float(fd[hit_fd]), 0.005, text=f"release_speed {label}_fd t={float(t_state[index])} index={index}")
+    hit_w = _first_over(omega, 0.05)
+    if hit_w is not None:
+        index = k0 + start + hit_w
+        _add(reasons, "release_speed", case_id, label + "_omega", float(omega[hit_w]), 0.05, text=f"release_speed {label}_omega t={float(t_state[index])} index={index}")
+    return {"v": float(np.max(speed)), "w": float(np.max(omega))}
+
+
+def _check_ramp_speed(reasons, case_id, tcp, twist, t_state, dt, unload_k, force_k):
+    if force_k < unload_k or force_k >= len(tcp) or twist.shape[0] < len(tcp):
+        _add(reasons, "sample_count", case_id, "ramp_window")
+        return None
+    speed = np.linalg.norm(twist[unload_k : force_k + 1, :3], axis=1)
+    fd = np.linalg.norm(np.diff(tcp[unload_k : force_k + 1], axis=0), axis=1) / float(dt)
+    if speed.size != force_k - unload_k + 1 or fd.size != force_k - unload_k:
+        _add(reasons, "sample_count", case_id, "ramp_window")
+        return None
+    hit = _first_over(speed, 0.03)
+    if hit is not None:
+        index = unload_k + hit
+        _add(reasons, "release_speed", case_id, "ramp_speed", float(speed[hit]), 0.03, text=f"release_speed ramp_speed t={float(t_state[index])} index={index}")
+    elif fd.size:
+        hit_fd = _first_over(fd, 0.03)
+        if hit_fd is not None:
+            index = unload_k + hit_fd
+            _add(reasons, "release_speed", case_id, "ramp_fd", float(fd[hit_fd]), 0.03, text=f"release_speed ramp_fd t={float(t_state[index])} index={index}")
+    return float(np.max(speed)) if speed.size else 0.0
+
+
+def _check_slow_stimulus(reasons, case_id, external, t_state, dt, unload_k, force_k):
+    t0 = float(t_state[unload_k])
+    for k in range(unload_k, force_k):
+        remain = max(1.0 - (float(t_state[k]) - t0) / RELEASE_RAMP_S, 0.0)
+        expected = -RELEASE_FORCE_N * remain
+        force = np.asarray(external[k], dtype=float)
+        if abs(float(force[0]) - expected) > RAMP_FORCE_ATOL or float(np.linalg.norm(force[1:3])) > FORCE_ZERO or float(np.linalg.norm(force[3:])) > TORQUE_ZERO:
+            _add(reasons, "event_mismatch", case_id, "ramp_force", float(force[0]), expected, text=f"event_mismatch ramp_force t={float(t_state[k])} index={k}")
+            break
+    if abs(float(t_state[force_k]) - (t0 + RELEASE_RAMP_S)) > float(dt) + 1e-9:
+        _add(reasons, "unload_duration", case_id, "force_zero", float(t_state[force_k] - t0), RELEASE_RAMP_S)
+
+
+def _score_release(reasons, metrics, case_id, family, rebuilt, command, external, twist, tcp, t_state, dt, meta):
+    found = _release_events(reasons, case_id, rebuilt, command, external)
+    if found is None:
         return
-    force_k = int(zero[0])
+    blocked_k, unload_k, force_k = found
+    metrics["events"]["blocked_first"] = float(t_state[blocked_k])
     metrics["events"]["unload_start"] = float(t_state[unload_k])
     metrics["events"]["force_zero"] = float(t_state[force_k])
-    if float(t_state[force_k] - t_state[unload_k]) > dt + 1e-9:
-        _add(reasons, "unload_duration", case_id, "force_zero", float(t_state[force_k] - t_state[unload_k]), dt)
+    if family == "release":
+        metrics["events"]["blocked"] = float(t_state[blocked_k])
+        metrics["events"]["release"] = float(t_state[force_k])
     if not np.any(external[:unload_k, 0] < -2.5):
         _add(reasons, "event_mismatch", case_id, "load")
-    if t_state[-1] < t_state[unload_k] + 1.0 - 1e-9:
-        _add(reasons, "sample_count", case_id, "release_window")
+    if not np.any(command[:unload_k, 0] > 0.02):
+        _add(reasons, "event_mismatch", case_id, "push")
+    full = _step_count(dt, 1.0)
+    if family == "release_fast":
+        gap = float(t_state[force_k] - t_state[unload_k])
+        if gap < -1e-15 or gap > float(dt) + 1e-9:
+            _add(reasons, "unload_duration", case_id, "force_zero", gap, dt)
+        if not _window_fits(len(tcp), unload_k, full) or not _window_fits(len(tcp), force_k, full):
+            _add(reasons, "sample_count", case_id, "release_window")
+    else:
+        _check_slow_stimulus(reasons, case_id, external, t_state, dt, unload_k, force_k)
+        if not _window_fits(len(tcp), unload_k, full) or not _window_fits(len(tcp), force_k, full):
+            _add(reasons, "sample_count", case_id, "release_window")
+        if "release_time" in meta and abs(float(meta["release_time"]) - float(t_state[force_k])) > 1e-9:
+            _add(reasons, "event_missing", case_id, "release_time", meta.get("release_time"), float(t_state[force_k]))
     check_release_tail(reasons, case_id, command, external, t_state, unload_k, force_k)
-    for label, index in (("unload", unload_k), ("force_zero", force_k)):
-        _release_window(reasons, case_id, label, float(t_state[index]), index, twist, tcp, t_state, dt, command)
-
-
-def _release_window(reasons, case_id, label, t0, index, twist, tcp, t_state, dt, command):
-    times = t_state[1:]
-    speed = np.linalg.norm(twist[1:, :3], axis=1)
-    fd = np.linalg.norm(np.diff(tcp, axis=0), axis=1) / dt
-    omega = np.linalg.norm(twist[1:, 3:], axis=1)
-    half = (times >= t0) & (times <= t0 + 0.5)
-    stable = (times >= t0 + 0.8) & (times <= t0 + 1.0)
-    if not np.any(half) or not np.any(stable):
-        _add(reasons, "sample_count", case_id, label)
-        return
-    if np.any(speed[half] > 0.03 + 1e-9) or np.any(fd[half] > 0.03 + 1e-9):
-        _add(reasons, "release_speed", case_id, label + "_speed", float(np.max(speed[half])), 0.03)
-    extra = tcp[1:][half] - tcp[index]
-    if np.any(np.maximum(0.0, extra @ RELEASE_DIRECTION) > 0.005 + 1e-9):
-        _add(reasons, "release_speed", case_id, label + "_displacement")
-    if np.any(speed[stable] > 0.005 + 1e-9) or np.any(omega[stable] > 0.05 + 1e-9):
-        _add(reasons, "release_speed", case_id, label + "_stable")
-    cmd = np.linalg.norm(command[:, :3], axis=1)
-    if np.any(cmd[(t_state[:-1] >= t0) & (t_state[:-1] <= t0 + 1.0)] > 1e-4):
-        _add(reasons, "release_speed", case_id, label + "_command")
+    unload_peak = _check_transient(reasons, case_id, "unload", tcp, twist, t_state, dt, unload_k)
+    if unload_peak is not None:
+        metrics["unload_speed_peak"] = unload_peak["speed"]
+        metrics["times"]["unload_speed_peak"] = float(t_state[unload_k])
+    if family == "release":
+        ramp_peak = _check_ramp_speed(reasons, case_id, tcp, twist, t_state, dt, unload_k, force_k)
+        if ramp_peak is not None:
+            metrics["ramp_speed_peak"] = ramp_peak
+            metrics["times"]["ramp_speed_peak"] = float(t_state[unload_k])
+        start = _step_count(dt, 0.8)
+        end = _step_count(dt, 1.0)
+        if start is not None and _window_fits(len(tcp), unload_k, end):
+            speed = np.linalg.norm(twist[unload_k + start : unload_k + end + 1, :3], axis=1)
+            omega = np.linalg.norm(twist[unload_k + start : unload_k + end + 1, 3:], axis=1)
+            if speed.size:
+                metrics["diagnostic_ramp_v"] = float(np.max(speed))
+                metrics["diagnostic_ramp_w"] = float(np.max(omega))
+                metrics["times"]["diagnostic_ramp_v"] = float(t_state[unload_k + start])
+    else:
+        held = _check_stable(reasons, case_id, "unload", tcp, twist, t_state, dt, unload_k)
+        if held is not None:
+            metrics["unload_stable_v"] = held["v"]
+            metrics["times"]["unload_stable_v"] = float(t_state[unload_k])
+    force_peak = _check_transient(reasons, case_id, "force_zero", tcp, twist, t_state, dt, force_k)
+    if force_peak is not None:
+        metrics["force_speed_peak"] = force_peak["speed"]
+        metrics["times"]["force_speed_peak"] = float(t_state[force_k])
+    settled = _check_stable(reasons, case_id, "force_zero", tcp, twist, t_state, dt, force_k)
+    if settled is not None:
+        metrics["force_stable_v"] = settled["v"]
+        metrics["force_stable_w"] = settled["w"]
+        metrics["times"]["force_stable_v"] = float(t_state[force_k])
 
 
 def _abc(metrics: dict, reasons: list) -> list[dict]:
@@ -952,9 +1062,42 @@ def _abc(metrics: dict, reasons: list) -> list[dict]:
                 if family == "gear":
                     events.update(("contact", "switch", "gain_complete"))
                 if family == "release":
-                    events.update(("blocked", "release"))
+                    events.update(("blocked", "blocked_first", "unload_start", "force_zero", "release"))
                 if family == "release_fast":
                     events.update(("blocked_first", "unload_start", "force_zero"))
+                release_pairs = []
+                if family in {"release", "release_fast"}:
+                    release_pairs.append(("unload_speed_peak", 0.1, 1e-4, "m/s"))
+                    release_pairs.append(("force_stable_v", 0.1, 1e-4, "m/s"))
+                if family == "release":
+                    release_pairs.append(("ramp_speed_peak", 0.1, 1e-4, "m/s"))
+                    release_pairs.append(("diagnostic_ramp_v", 0.1, 1e-4, "m/s"))
+                for key, frac, floor, unit in release_pairs:
+                    if key not in base or key not in other:
+                        _add(reasons, "missing_comparison", other_id, key)
+                        continue
+                    item = compare_scalar(key, base[key], other[key], frac, floor)
+                    passed = None if key == "diagnostic_ramp_v" else item is None
+                    rows.append(
+                        {
+                            "family": family,
+                            "seed": seed,
+                            "pair": f"A/{variant}",
+                            "metric": key,
+                            "unit": unit,
+                            "role": "diagnostic_during_ramp" if key == "diagnostic_ramp_v" else "scored",
+                            "a": float(base[key]),
+                            "b": float(other[key]),
+                            "a_time": base["times"].get(key),
+                            "b_time": other["times"].get(key),
+                            "delta": abs(float(base[key]) - float(other[key])),
+                            "allow": max(frac * max(float(base[key]), float(other[key])), floor),
+                            "passed": passed,
+                        }
+                    )
+                    if key != "diagnostic_ramp_v" and item is not None:
+                        item["case_id"] = other_id
+                        reasons.append(item)
                 if family == "pause":
                     events.add("pause")
                 if family == "wrench":
@@ -1064,6 +1207,23 @@ def evaluate_evidence(run, check_workspace: bool = False) -> dict:
             try:
                 if kind == "physical":
                     metrics[case_id] = _check_physical(case_id, run, reasons)
+                elif kind == "v6zero":
+                    from feedingrobot.controllers.v6checks import check_zero_grid
+
+                    target = run / "cases" / f"{case_id}.json"
+                    if not target.is_file():
+                        _add(reasons, "missing_case", case_id, "json")
+                    else:
+                        reasons.extend(check_zero_grid(case_id, _load(target)))
+                elif kind == "v6trace":
+                    from feedingrobot.controllers.v6checks import check_trace
+
+                    npz_path = run / "cases" / f"{case_id}.npz"
+                    js_path = run / "cases" / f"{case_id}.json"
+                    if not npz_path.is_file() or not js_path.is_file():
+                        _add(reasons, "missing_case", case_id, "npz")
+                    else:
+                        reasons.extend(check_trace(case_id, np.load(npz_path, allow_pickle=False), _load(js_path)))
                 elif kind == "array" and case_id == "F6-pause1000":
                     target = run / "cases" / f"{case_id}.npz"
                     if not target.is_file():
@@ -1287,9 +1447,11 @@ def apply_tamper(name: str, run: Path) -> None:
         data = np.load(path, allow_pickle=False)
         payload = {key: np.array(data[key]) for key in data.files}
         payload["tcp_pos"] = np.array(payload["tcp_pos"])
-        payload["tcp_pos"][100:, 0] += 0.2
         payload["tcp_twist"] = np.array(payload["tcp_twist"])
-        payload["tcp_twist"][100:, 0] = 0.2
+        # After blocked (0.148 s). Index 100 is still in the push and erases the rebuilt blocked event.
+        start = int(np.argmin(np.abs(np.asarray(payload["t_state"], dtype=float) - 0.20)))
+        payload["tcp_pos"][start:, 0] += 0.2
+        payload["tcp_twist"][start:, 0] = 0.2
         if path.exists():
             path.unlink()
         np.savez(path, **payload)
@@ -1412,6 +1574,55 @@ def apply_tamper(name: str, run: Path) -> None:
             mask = (times >= 0.5) & (times < 0.6)
             payload["external_wrench"][mask, 0] = -3.0
         _edit_case(run, "release_fast-s0-A", _reload)
+    elif name == "slow_spike":
+        def _spike(payload):
+            times = np.asarray(payload["t_state"], dtype=float)
+            index = int(np.argmin(np.abs(times - 0.3)))
+            payload["tcp_twist"] = np.array(payload["tcp_twist"])
+            payload["tcp_twist"][index, 0] = 0.5
+        _edit_case(run, "release-s0-A", _spike)
+    elif name == "slow_ramp_late":
+        def _late(payload):
+            times = np.asarray(payload["t_state"], dtype=float)
+            index = int(np.argmin(np.abs(times - 1.1)))
+            payload["tcp_twist"] = np.array(payload["tcp_twist"])
+            payload["tcp_twist"][index, 0] = 0.5
+        _edit_case(run, "release-s0-A", _late)
+    elif name == "joint_projection":
+        path = run / "cases" / "V6-zero-j0-upper-linear-A.json"
+        row = _load(path)
+        row["beta"] = 0.0
+        row["final"] = list(row["candidate"])
+        row["p_after"] = (np.asarray(row["p_before"], dtype=float) + np.asarray(row["candidate"], dtype=float)[:3] * float(row["dt"])).tolist()
+        row["correction"] = [0.0, 0.0, 0.0]
+        _unlink_write(path, json.dumps(row))
+        _rehash(run, "cases/V6-zero-j0-upper-linear-A.json")
+    elif name == "singularity_stop":
+        def _running(payload):
+            payload["mode"] = np.array(["RUNNING"] * len(payload["mode"]))
+            payload["guard_status"] = np.array(["RUNNING"] * len(payload["guard_status"]))
+            payload["execution"] = np.array(["run"] * len(payload["execution"]))
+        _edit_case(run, "V6-stop-rest-A", _running)
+    elif name == "stop_torque":
+        def _task(payload):
+            payload["tau_task"] = np.array(payload["tau_task"])
+            payload["tau_task"][:, 0] = 1.0
+        _edit_case(run, "V6-stop-rest-A", _task)
+    elif name == "fault_tick":
+        def _tick(payload):
+            payload["fault_tick"] = np.int64(int(np.asarray(payload["fault_tick"]).reshape(-1)[0]) + 50)
+        _edit_case(run, "V6-stop-rest-A", _tick)
+    elif name == "auto_resume":
+        def _resume(payload):
+            payload["command"] = np.array(payload["command"])
+            payload["command"][-1, 0] = 0.05
+        _edit_case(run, "V6-stop-rest-A", _resume)
+    elif name == "stop_speed":
+        def _fast(payload):
+            payload["dq"] = np.array(payload["dq"])
+            payload["dq"][:, 1] = 0.1
+            payload["stopped_ok"] = np.int8(1)
+        _edit_case(run, "V6-stop-rest-A", _fast)
     else:
         raise KeyError(name)
 
@@ -1505,7 +1716,7 @@ def _drop_index(run: Path, case_id: str, index: int) -> None:
 def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
     from feedingrobot.controllers.acceptance import REMAINING_FULL_M2, SCHEMA_VERSION, SCOPE_NAME
 
-    if scope in {"fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4"}:
+    if scope in {"fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4", "fixes-v5"}:
         return {
             "fixes_passed": False,
             "tests_passed": False,
@@ -1513,11 +1724,11 @@ def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
             "evidence_valid": False,
             "scope_passed": False,
             "hybrid_force_status": "disabled",
-            "reasons": [reason("unsupported_schema", text=f"{scope} is not a V5 certification")],
+            "reasons": [reason("unsupported_schema", text=f"{scope} is not a V6 certification")],
             "scope": scope,
             "remaining_m2_requirements": list(REMAINING_FULL_M2),
         }
-    if scope not in {"fixes-v5", "full"}:
+    if scope not in {"fixes-v6", "full"}:
         return {
             "fixes_passed": False,
             "m3_ready": False,
@@ -1537,6 +1748,8 @@ def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
             report = _load(run / "report.json")
         except ValueError:
             _add(reasons, "unreadable", field="report.json")
+    if report.get("release_scoring_version") != RELEASE_SCORING_VERSION:
+        _add(reasons, "summary_mismatch", field="release_scoring_version")
     if report.get("schema_version") != SCHEMA_VERSION:
         _add(reasons, "unsupported_schema", field="schema_version", expected=None)
         reasons[-1]["text"] = "unsupported schema " + str(report.get("schema_version"))
@@ -1550,7 +1763,7 @@ def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
     if report.get("fixes_passed") is not core_fixes or report.get("evidence_valid") is not verdict["evidence_valid"]:
         _add(reasons, "summary_mismatch", field="report.json")
     adv_path = run / "adversarial_results.json"
-    if scope == "fixes-v5" and not any(item["code"] in STRUCTURAL for item in verdict["reasons"]):
+    if scope == "fixes-v6" and not any(item["code"] in STRUCTURAL for item in verdict["reasons"]):
         fresh = run_adversarial(run)
         if not adv_path.is_file():
             _add(reasons, "missing_file", field="adversarial_results.json")
@@ -1562,15 +1775,28 @@ def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
                 if row["fixes_passed"] or not row["codes"]:
                     _add(reasons, "summary_mismatch", field=row["name"])
         exec_path = run / "adversarial_execution.json"
-        if not exec_path.is_file() or int(_load(exec_path).get("exitstatus", 1)) != 0:
-            _add(reasons, "exitstatus", field="adversarial_execution.json")
+        if not exec_path.is_file():
+            _add(reasons, "missing_file", field="adversarial_execution.json")
+        else:
+            execution = _load(exec_path)
+            if int(execution.get("exitstatus", 1)) != 0:
+                _add(reasons, "exitstatus", field="adversarial_execution.json")
+            from feedingrobot.controllers.acceptance import V6_PACKAGE_NODEID
+
+            reports = execution.get("reports") or []
+            wanted = {"setup": [], "call": [], "teardown": []}
+            for item in reports:
+                if item.get("nodeid") == V6_PACKAGE_NODEID and item.get("when") in wanted:
+                    wanted[item["when"]].append(item.get("outcome"))
+            if V6_PACKAGE_NODEID not in (execution.get("collected") or []) or wanted["setup"] != ["passed"] or wanted["call"] != ["passed"] or wanted["teardown"] != ["passed"]:
+                _add(reasons, "nodeid", field=V6_PACKAGE_NODEID)
     if scope == "full":
         _add(reasons, "full_incomplete", text="full M2 still missing: " + "; ".join(REMAINING_FULL_M2))
         reasons[-1]["text"] = "full M2 still missing: " + "; ".join(REMAINING_FULL_M2)
     structural = [item for item in reasons if item.get("code") in STRUCTURAL]
     metric = [item for item in reasons if item.get("code") not in STRUCTURAL and item.get("code") != "full_incomplete"]
     fixes_passed = not structural and not metric
-    scope_passed = fixes_passed if scope == "fixes-v5" else False
+    scope_passed = fixes_passed if scope == "fixes-v6" else False
     return {
         "fixes_passed": fixes_passed,
         "tests_passed": bool(verdict["tests_passed"]) and not structural,

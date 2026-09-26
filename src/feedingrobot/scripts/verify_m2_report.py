@@ -17,7 +17,7 @@ def assess_m2(run: Path, scope: str, check_workspace: bool) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Check an M2 run directory without resimulating.")
     parser.add_argument("--run", required=True)
-    parser.add_argument("--scope", default="full", choices=("fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4", "fixes-v5", "full"))
+    parser.add_argument("--scope", default="full", choices=("fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4", "fixes-v5", "fixes-v6", "full"))
     parser.add_argument("--check-current-workspace", action="store_true")
     args = parser.parse_args()
     run = Path(args.run)
@@ -43,7 +43,7 @@ def main():
             indent=2,
         )
     )
-    if args.scope == "fixes-v5" and verdict.get("scope_passed") and verdict["m3_ready"] is False:
+    if args.scope == "fixes-v6" and verdict.get("scope_passed") and verdict["m3_ready"] is False:
         return
     raise SystemExit(1)
 

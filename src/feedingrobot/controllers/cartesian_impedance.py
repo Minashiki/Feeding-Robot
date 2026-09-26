@@ -13,6 +13,11 @@ from feedingrobot.controllers.wrench import WrenchPipeline, predict_tool_wrench
 _ARM = 7
 
 
+def enters_singularity_stop(rho: float, rho_stop: float) -> bool:
+    """True at and below the stop threshold. The slowdown band above it is not a stop."""
+    return bool(np.isfinite(rho) and float(rho) <= float(rho_stop))
+
+
 def singularity_gains(rho: float, eps_normal: float, eps_singular: float, rho_normal: float, rho_stop: float) -> tuple[float, float]:
     """Return (command scale, epsilon). Scale falls from 1 to 0 across the singular band."""
     if rho >= rho_normal:
@@ -317,11 +322,52 @@ class CartesianImpedance:
         mass = self._mass()
         scale_mat = np.diag([1, 1, 1, self.length, self.length, self.length])
         j_s = scale_mat @ jacobian
-        singular = np.linalg.svd(j_s, compute_uv=False)
-        rho = float(singular[-1] / singular[0]) if singular[0] > 0 else 0.0
+        finite_model = bool(np.all(np.isfinite(jacobian)) and np.all(np.isfinite(mass)) and np.all(np.isfinite(q)) and np.all(np.isfinite(dq)))
+        if not finite_model:
+            rho = float("nan")
+        else:
+            try:
+                singular = np.linalg.svd(j_s, compute_uv=False)
+                rho = float(singular[-1] / singular[0]) if singular[0] > 0.0 and np.isfinite(singular[0]) else 0.0
+            except np.linalg.LinAlgError:
+                rho = float("nan")
+        if not np.isfinite(rho):
+            if self.guard is not None:
+                self.guard.latch(
+                    {
+                        "tick": int(state["tick"]),
+                        "time": self.sim_time,
+                        "reason": "non-finite",
+                        "phase": self.phase,
+                        "pair": None,
+                        "geoms": None,
+                        "measured": "jacobian",
+                        "limit": None,
+                    }
+                )
+                self.guard.status = "ABORTED"
+            return np.zeros(_ARM), {"apply": False, "status": "ABORTED", "phase_k": self.phase, "gear": "STOP"}
         cmd_scale, eps = singularity_gains(rho, self.eps_normal, self.eps_singular, self.rho_normal, self.rho_stop)
         null, jbar, lam2 = damped_nullspace(j_s, mass, eps, self.a_floor)
         stopping = self.guard is not None and self.guard.status in {"STOPPING", "STOPPED"}
+        if self.guard is not None and self.guard.status != "ABORTED" and enters_singularity_stop(rho, self.rho_stop):
+            if self.guard.failure is None:
+                self.guard.begin_stop(
+                    {
+                        "tick": int(state["tick"]),
+                        "time": self.sim_time,
+                        "reason": "singularity",
+                        "phase": self.phase,
+                        "pair": None,
+                        "geoms": None,
+                        "measured": rho,
+                        "limit": self.rho_stop,
+                    }
+                )
+            if self.guard.status == "RUNNING":
+                self.guard.status = "STOPPING"
+            self.power_on = False
+            stopping = self.guard.status in {"STOPPING", "STOPPED"}
         if stopping and not self._stop_anchored:
             self.reference.reanchor(self._tcp_pos, self._tcp_rot)
             self._stop_anchored = True
@@ -350,15 +396,22 @@ class CartesianImpedance:
             twist = active_cmd["twist"].copy()
         if self.power_on or stopping or (self.guard is not None and self.guard.failure is not None):
             twist = np.zeros(6)
-        self._update_gains(dt)
+        if stopping:
+            self.transition_active = False
+            self.transition_elapsed = self.blend_s
+            self._k = np.zeros(6)
+            self._d = np.zeros(6)
+            self._blend = 1.0
+        else:
+            self._update_gains(dt)
         limits = self.effective_limits()
         if stopping:
             for key in ("v", "w", "a", "alpha"):
                 limits[key] = 0.0
-        if self.power_on:
-            execution = "power_on"
-        elif stopping or expired:
+        if stopping or expired:
             execution = "stop"
+        elif self.power_on:
+            execution = "power_on"
         elif cmd_scale <= 0.0:
             execution = "prohibit"
         elif float(np.linalg.norm(twist)) == 0.0:
@@ -383,7 +436,7 @@ class CartesianImpedance:
             active=execution in {"run", "zero"},
             saturated=bool(self._pause_advance) and not self.power_on,
             execution=execution,
-            project=None if execution != "run" else project,
+            project=project if execution in {"run", "zero"} else None,
         )
         e = np.concatenate(
             [
@@ -416,7 +469,7 @@ class CartesianImpedance:
         tau_cmd = clip_torque(tau_raw, tau_before, self.tau_max, self.rate, dt)
         self._last_tau_raw = tau_raw.copy()
         self._tau_before = tau_before
-        if self.power_on:
+        if self.power_on and not stopping:
             self.power_time += dt
             err = float(np.linalg.norm(self.reference.p_ref - self._tcp_pos))
             speed = float(np.max(np.abs(dq)))
@@ -445,8 +498,8 @@ class CartesianImpedance:
             "phase_k": self.phase,
             "gear": "STOP" if stopping else self.target_gear,
             "wrench_gear": "STOP" if stopping else (gear_of(self.phase) if self.phase in GEAR_OF else "FREE"),
-            "control_mode": "POWER_ON" if self.power_on else ("STOPPING" if stopping else "RUNNING"),
-            "status": "POWER_ON" if self.power_on else (self.guard.status if self.guard is not None else "RUNNING"),
+            "control_mode": (self.guard.status if self.guard is not None else "STOPPING") if stopping else ("POWER_ON" if self.power_on else "RUNNING"),
+            "status": (self.guard.status if self.guard is not None else "STOPPING") if stopping else ("POWER_ON" if self.power_on else (self.guard.status if self.guard is not None else "RUNNING")),
             "q": q.copy(),
             "dq": dq.copy(),
             "p": self._tcp_pos.copy(),
@@ -486,6 +539,7 @@ class CartesianImpedance:
             "tau_before": tau_before.copy(),
             "e": e.copy(),
             "execution": execution,
+            "candidate_twist": np.asarray(shaped.get("candidate", np.zeros(6)), dtype=float),
             "beta": float(shaped.get("beta", 1.0)),
             "v_hist": np.asarray(shaped.get("v_hist", np.zeros(6)), dtype=float),
             "qdot_pred": jbar @ (scale_mat @ np.asarray(shaped.get("v_hist", np.zeros(6)), dtype=float)),

@@ -115,6 +115,12 @@ class Guard:
         elif self.status == "RUNNING":
             self.status = "STOPPING"
 
+    def begin_stop(self, fault: dict) -> None:
+        """Latch a pre-step stop and start the hold clock at the interval start."""
+        self.latch(fault)
+        if self.status in {"STOPPING", "STOPPED"} and self._stop_since is None:
+            self._stop_since = float(fault["time"])
+
     def observe(self, state: dict, phase: str, control_info: dict | None = None, measurement: dict | None = None) -> None:
         self.phase = phase
         info = control_info or {}

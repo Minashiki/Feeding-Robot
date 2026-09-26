@@ -12,8 +12,9 @@ from feedingrobot.scripts.validate_m1 import _tracked_files
 from feedingrobot.sim.model import repo_root
 from feedingrobot.sim.report import assess_run
 
-SCHEMA_VERSION = "m2-fix-v5"
-SCOPE_NAME = "fixes_v5"
+SCHEMA_VERSION = "m2-fix-v6"
+SCOPE_NAME = "fixes_v6"
+V6_PACKAGE_NODEID = "tests/test_m2_v6.py::test_v6_package_tampers_are_rejected"
 F4_SPEED_LIMIT_M_S = 0.01
 JOINT_SPEED_LIMIT = 0.5
 JOINT_PREDICT_LIMIT = 0.4
@@ -84,13 +85,18 @@ LEGACY_NODEIDS = (
 )
 
 REMAINING_FULL_M2 = (
+    "T04 full three-pose axis steps, shaping-complete, 1.5 s settle and overshoot",
+    "T05 three-pose continuous paths, two loops, orientation sine, start-stop",
+    "T06 six unloaded poses and the full wrench matrix",
+    "T07 exact_model and estimated_kinematics dynamic matrix",
     "T08 spring surface",
     "T09 stiffness trend",
     "T10 blocked release on a physical wall",
     "T11 force pulse recovery",
+    "T12 T13 T14 remaining contact, fault, and replay cells beyond the V6 subpaths",
     "T15 noise and delay on T05/T08",
     "T16 P0 bridge",
-    "T17 full-matrix tamper cases beyond fixes-v5",
+    "T17 full-matrix tamper cases beyond fixes-v6",
     "formal seeds 3-8",
     "full A/B/C matrix from M2Plan",
 )
@@ -124,6 +130,22 @@ def f5_case_ids() -> list[str]:
             for interrupt_ms in (50, 150):
                 for dt in (0.001, 0.0005):
                     rows.append(f"F5-{src}-{dst}-{interrupt_ms}-{dt}")
+    return rows
+
+
+def v6_zero_grid_ids() -> list[str]:
+    return [
+        f"V6-zero-j{joint}-{side}-{motion}-{variant}"
+        for joint in range(7)
+        for side in ("upper", "lower")
+        for motion in ("linear", "angular", "mixed")
+        for variant in ("A", "B")
+    ]
+
+
+def v6_trace_ids() -> list[str]:
+    rows = [f"V6-zero-phys-{side}-{variant}" for side in ("upper", "lower") for variant in ("A", "B", "C")]
+    rows.extend(f"V6-stop-{name}-{variant}" for name in ("rest", "cross") for variant in ("A", "B", "C"))
     return rows
 
 
@@ -163,6 +185,8 @@ def required_case_ids() -> list[str]:
         "replay-s1",
         "replay-s2",
         *physical_case_ids(),
+        *v6_zero_grid_ids(),
+        *v6_trace_ids(),
     ]
     if len(rows) != len(set(rows)):
         raise RuntimeError("duplicate V2 case id")
@@ -200,6 +224,30 @@ def required_nodeids() -> list[str]:
         "test_release_tail_rejects_reload_and_keeps_boundaries",
     ):
         nodes.append(f"tests/test_m2_v5.py::{name}")
+    for dt in ("0.001", "0.0005"):
+        nodes.append(f"tests/test_m2_v6.py::test_zero_command_still_projects_outward_history[{dt}]")
+        nodes.append(f"tests/test_m2_v6.py::test_singular_region_enters_latched_controlled_stop[{dt}]")
+    for name in (
+        "test_joint_allow_boundaries",
+        "test_zero_far_from_limit_decelerates",
+        "test_inward_history_is_not_frozen",
+        "test_multi_axis_uses_strictest_beta",
+        "test_stop_power_on_and_prohibit_do_not_integrate",
+        "test_zero_history_does_not_rewind",
+        "test_rho_threshold_edges",
+        "test_first_fault_is_kept",
+        "test_power_on_blend_yields_to_singularity",
+        "test_rho_recovery_stays_latched",
+        "test_reset_clears_or_relatches_singularity",
+        "test_slow_release_scores_from_unload",
+        "test_release_boundaries_and_fast_stable_window",
+        "test_adversarial_io_error_is_reported",
+    ):
+        nodes.append(f"tests/test_m2_v6.py::{name}")
+    for case_id in v6_zero_grid_ids():
+        nodes.append(f"tests/test_m2_v6.py::test_zero_projection_grid[{case_id}]")
+    for case_id in v6_trace_ids():
+        nodes.append(f"tests/test_m2_v6.py::test_v6_trace[{case_id}]")
     return nodes
 
 
