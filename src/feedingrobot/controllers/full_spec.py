@@ -1,7 +1,7 @@
 """Frozen M2 full matrix. Case identity determines stimuli, never trace metadata."""
 from dataclasses import asdict, dataclass
 
-SCHEMA = "m2-full-v1"
+SCHEMA = "m2-full-v2"
 VARIANTS = {"A": (.001, 50, 1e-8), "B": (.0005, 50, 1e-8), "C": (.001, 100, 1e-9)}
 FORMAL_SEEDS = tuple(range(3, 9))
 CALIBRATION_SEEDS = (0, 1, 2)

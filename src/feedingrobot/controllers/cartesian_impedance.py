@@ -137,6 +137,7 @@ class CartesianImpedance:
         self.transition_active = False
         self.sim_time = float(state.get("episode_time", 0.0))
         if self.guard is not None:
+            self.guard.bind_model(self.model)
             self.guard.reset()
         self._seed_wrench(state)
         if self.guard is not None:
@@ -645,7 +646,10 @@ def control_step(controller: CartesianImpedance, guard, phase: str | None = None
     state = controller.scene.snapshot()
     if not np.all(np.isfinite(state["raw_wrench_sensor"])):
         controller._abort_input("non-finite-wrench", controller.now())
-    if phase is not None and (guard.failure is None) and controller.guard.status == "RUNNING" and not controller.power_on:
+    if phase in {"STOP", "RECOVER"} and guard.status == "RUNNING":
+        controller.phase = phase
+        guard.request_stop(controller.scene.tick, controller.now(), phase)
+    elif phase is not None and (guard.failure is None) and controller.guard.status == "RUNNING" and not controller.power_on:
         controller.phase = phase
     was_power_on = bool(controller.power_on)
     tau, info = controller.compute(state, controller.scene.dt)

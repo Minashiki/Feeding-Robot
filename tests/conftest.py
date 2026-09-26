@@ -28,6 +28,7 @@ def pytest_runtest_logreport(report):
         "when": report.when,
         "outcome": report.outcome,
         "duration_s": float(getattr(report, "duration", 0.0)),
+        "wasxfail": getattr(report, "wasxfail", None),
     })
 
 

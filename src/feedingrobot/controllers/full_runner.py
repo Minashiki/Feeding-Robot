@@ -1,9 +1,9 @@
 """Physical M2 cases, all executed through the public torque-control step."""
 from __future__ import annotations
 
-import copy
 import json
 import os
+import uuid
 from pathlib import Path
 
 import mujoco
@@ -15,6 +15,7 @@ from feedingrobot.controllers.so3 import orientation_error, so3_exp
 from feedingrobot.controllers.full_spec import Case, VARIANTS
 from feedingrobot.sim.scene import FeedingScene
 from feedingrobot.sim.model import load_config
+from feedingrobot.controllers.full_identity import identity, clean_config, solver_options
 
 
 def smooth(t, duration):
@@ -48,7 +49,7 @@ def _ik_reset(scene, position, rotation):
 
 
 def prepare(case: Case, seed: int, controller_config: dict):
-    cfg = copy.deepcopy(controller_config)
+    cfg = clean_config(controller_config)
     scene_cfg = load_config("configs/m1_scene.json")
     fixture = case.fixture
     if fixture:
@@ -57,6 +58,7 @@ def prepare(case: Case, seed: int, controller_config: dict):
     scene = FeedingScene(scene_cfg)
     preset = "food_on_spoon" if case.family == "carry" or case.context == "food" else "near_mouth" if case.family == "mouth" else "food_on_plate"
     state = scene.reset(seed=seed, preset=preset, settle_steps=0)
+    reset_qpos = scene.data.qpos.copy()
     if case.family not in {"carry", "plate", "mouth"} and case.context != "food":
         q = np.array(scene.config["q_torque_poses"][case.pose % 3], dtype=float)
         if case.pose >= 3:
@@ -102,6 +104,9 @@ def prepare(case: Case, seed: int, controller_config: dict):
     state = scene.snapshot()
     if scene._illegal():
         raise RuntimeError(f"illegal initial state: {case.key}, seed={seed}")
+    source = {'case': case.key, 'seed': seed, 'preset': preset,
+              'reset_qpos': reset_qpos.tolist(), 'pre_settle_qpos': scene.data.qpos.tolist(),
+              'pre_settle_qvel': scene.data.qvel.tolist()}
     ctl = CartesianImpedance(scene, cfg)
     guard = Guard(cfg, cfg["joint_speed_limit_rad_s"])
     ctl.guard = guard
@@ -117,6 +122,8 @@ def prepare(case: Case, seed: int, controller_config: dict):
     snapshot = {name: np.array(getattr(scene.data, name), copy=True) for name in ("qpos", "qvel", "act", "ctrl", "qacc_warmstart")}
     snapshot["time"] = float(scene.data.time)
     snapshot["tau"] = scene.last_tau.copy()
+    source['settled'] = {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in snapshot.items()}
+    scene.m2_initial_source = source
     return scene, cfg, snapshot
 
 
@@ -164,6 +171,9 @@ def run_variant(case, seed, variant, scene, cfg, initial):
     scene.time_offset = initial["time"]
     scene.dt, scene.model.opt.iterations, scene.model.opt.tolerance = VARIANTS[variant]
     scene.model.opt.timestep = scene.dt
+    options_before = solver_options(scene.model)
+    assert (options_before['dt'], options_before['iterations'], options_before['tolerance']) == VARIANTS[variant]
+    execution_id = uuid.uuid4().hex
     scene.data.xfrc_applied[:] = 0
     scene.data.qfrc_applied[:] = 0
     mujoco.mj_forward(scene.model, scene.data)
@@ -284,6 +294,15 @@ def run_variant(case, seed, variant, scene, cfg, initial):
                 "effective_controller": cfg, "joint_ranges": ctl.ranges.tolist(),
                 "normal": scene.fixture_normal.tolist() if case.fixture else None,
                 "mount": scene.model.body_pos[mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY, "test_mount")].tolist() if case.fixture else None}
+    options_after = solver_options(scene.model)
+    if options_after != options_before:
+        raise RuntimeError('solver changed during execution')
+    metadata.update(initial_source=scene.m2_initial_source, geometry_registry=guard.registry,
+                    execution={'id': execution_id, 'case': case.manifest(seed, variant),
+                               'solver_before': options_before, 'solver_after': options_after})
+    arrays.update(execution_id=np.array(execution_id), case_identity=np.array(identity(case.manifest(seed, variant))),
+                  config_identity=np.array(identity(cfg)), solver_identity=np.array(identity(options_before)),
+                  initial_source_identity=np.array(identity(scene.m2_initial_source)))
     return arrays, metadata
 
 
@@ -303,5 +322,13 @@ def run_group(case: Case, seed: int, config: dict, output: str | None = None):
             temporary = Path(str(path) + ".json.partial")
             temporary.write_text(json.dumps(metadata, indent=2))
             temporary.replace(str(path) + ".json")
+            from feedingrobot.controllers.full_acceptance import digest
+            receipt = {'case': case.manifest(seed, variant), 'execution': metadata['execution'],
+                       'initial_source_identity': str(arrays['initial_source_identity'].item()),
+                       'config_identity': str(arrays['config_identity'].item()),
+                       'npz_sha256': digest(str(path)+'.npz'), 'json_sha256': digest(str(path)+'.json'), 'complete': True}
+            temporary = Path(str(path)+'.execution.json.partial')
+            temporary.write_text(json.dumps(receipt, indent=2, allow_nan=False))
+            temporary.replace(str(path)+'.execution.json')
         results.append((arrays, metadata))
     return results

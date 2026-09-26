@@ -9,7 +9,9 @@ import sys
 from feedingrobot.controllers.full_spec import SCHEMA, cases, manifest, VARIANTS, FORMAL_SEEDS, CALIBRATION_SEEDS
 from feedingrobot.controllers.full_runner import run_group
 from feedingrobot.controllers.full_checks import score, compare
-from feedingrobot.controllers.full_acceptance import inputs, digest, evaluate
+from feedingrobot.controllers.full_acceptance import inputs, digest, evaluate, package_identity, result
+from feedingrobot.controllers.full_contracts import CONFIG_PATHS, required_nodes
+from feedingrobot.controllers.full_negatives import negative_nodes, check_negatives
 from feedingrobot.sim.model import repo_root
 
 
@@ -53,15 +55,19 @@ def run(args):
     from feedingrobot.scripts.m2_limited import current_limits,verify_limits
     verify_limits(current_limits())
     if args.workers not in (1,2):raise SystemExit('local workers must be 1 or 2')
+    if (args.scene_config,args.controller_config,args.acceptance_config) != CONFIG_PATHS:
+        raise SystemExit('only frozen project configuration paths are accepted')
     root=repo_root();out=Path(args.output).resolve()
     out.mkdir(parents=True,exist_ok=False)
     (out/'cases').mkdir()
     calibration=getattr(args,'calibrate',False)
     stage='calibration' if calibration else 'full'
-    write(out/'run.json',{'schema_version':SCHEMA,'stage':stage,'incomplete':True,'m3_ready':False})
+    header={'schema_version':SCHEMA,'stage':stage,'run_id':out.name,'incomplete':True,'m3_ready':False}
+    write(out/'run.json',header)
     before=inputs();write(out/'input_hash_before.json',before)
     config=json.loads((root/args.controller_config).read_text())
-    write(out/'controller_config.json',config)
+    for path in CONFIG_PATHS:
+        (out/Path(path).name).write_bytes((root/path).read_bytes())
     seeds=CALIBRATION_SEEDS if calibration else FORMAL_SEEDS
     write(out/'case_manifest.json',manifest(seeds))
     write(out/'environment.json',{'python':sys.version,'workers':args.workers})
@@ -80,8 +86,12 @@ def run(args):
                 proc=subprocess.run(command,cwd=root,stdout=log,stderr=subprocess.STDOUT)
             if proc.returncode:raise SystemExit(f'prerequisite {index} failed; see {out}')
         write(out/'legacy_binding.json',{'path':str(out/'legacy'),'sha256':digest(out/'legacy'/'report.json')})
-        env=os.environ.copy();env['M1_EXECUTION_PATH']=str(out/'execution.json');env['M1_RUN_ID']=out.name
-        tests=sorted(str(p.relative_to(root)) for p in (root/'tests').glob('test_m2_*.py'))
+        env=os.environ.copy()
+        for key in list(env):
+            if key.startswith('M2_') and (key.endswith('PACKAGE') or key.endswith('RESULTS') or key=='M2_EVIDENCE_DIR'):
+                env.pop(key)
+        env['M1_EXECUTION_PATH']=str(out/'execution.json');env['M1_RUN_ID']=out.name
+        tests=required_nodes()
         with (out/'pytest.txt').open('w') as log:
             proc=subprocess.run([sys.executable,'-m','pytest',*tests,'-q'],cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT)
         if proc.returncode:raise SystemExit('M2 regression failed')
@@ -94,8 +104,32 @@ def run(args):
         print(f'{len(progress)}/{len(jobs)} {row["case"]} seed={row["seed"]}: {"FAIL" if failed else "pass"}',flush=True)
     write(out/'input_hash_after.json',inputs())
     write(out/'evidence_manifest.json',{p.name:digest(p) for p in sorted((out/'cases').iterdir()) if p.is_file()})
-    write(out/'run.json',{'schema_version':SCHEMA,'stage':stage,'incomplete':False,'m3_ready':False})
-    verdict=evaluate(out,check_workspace=True,calibration=calibration)
+    verdict=evaluate(out,check_workspace=True,calibration=calibration,_require_negatives=False)
+    if not verdict['scope_passed']:
+        write(out/'report.json',verdict)
+        print(json.dumps({'m3_ready':False,'reasons':verdict['reasons'][:30]},indent=2))
+        return 1
+    if not calibration:
+        write(out/'negative_results.json',{'source':package_identity(out),'clean_passed':True,'results':[]})
+        env=os.environ.copy()
+        for key in list(env):
+            if key.startswith('M2_') and (key.endswith('PACKAGE') or key.endswith('RESULTS') or key=='M2_EVIDENCE_DIR'):
+                env.pop(key)
+        env.update(M2_FULL_PACKAGE=str(out),M2_FULL_RESULTS=str(out/'negative_results.json'),
+                   M1_EXECUTION_PATH=str(out/'negative_execution.json'),M1_RUN_ID=out.name+'-negatives')
+        with (out/'negative_pytest.txt').open('w') as log:
+            proc=subprocess.run([sys.executable,'-m','pytest',*negative_nodes(),'-q'],cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT)
+        errors=check_negatives(out)
+        if proc.returncode or errors or inputs()!=before:
+            write(out/'report.json',result(errors or [{'code':'negative_execution'}],verdict['metrics'],verdict['comparisons'],False))
+            return 1
+        verdict['m3_ready']=True
+        verdict['remaining_m2_requirements']=[]
     write(out/'report.json',verdict)
+    write(out/'run.json',{**header,'incomplete':False,'m3_ready':verdict['m3_ready']})
+    verdict=evaluate(out,check_workspace=True,calibration=calibration)
+    if not verdict['scope_passed']:
+        write(out/'run.json',header)
+        write(out/'report.json',verdict)
     print(json.dumps({key:value for key,value in verdict.items() if key not in {'metrics','comparisons'}},indent=2))
     return 0 if verdict['scope_passed'] else 1

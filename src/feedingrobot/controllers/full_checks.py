@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from feedingrobot.controllers.full_spec import Case, VARIANTS
-from feedingrobot.controllers.guard import contact_allowed, gear_of
+from feedingrobot.controllers.guard import recorded_contact_allowed, gear_of
 
 TAU_MAX = np.array([87., 87., 87., 87., 12., 12., 12.])
 RANGES = np.array([[-2.8973, 2.8973], [-1.7628, 1.7628], [-2.8973, 2.8973],
@@ -70,7 +70,7 @@ def expected_stimulus(case, times):
     return supplied, external, phase
 
 
-def score(case: Case, seed, variant, data, meta, stop_damping=8.):
+def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=None):
     d = {key: np.asarray(value) for key, value in data.items()}
     failures = []
     def check(ok, code, observed=None):
@@ -79,6 +79,11 @@ def score(case: Case, seed, variant, data, meta, stop_damping=8.):
     expected = case.manifest(seed, variant)
     for key, value in expected.items():
         check(meta.get(key) == value, "identity:"+key)
+    from feedingrobot.controllers.full_identity import check_identity
+    failures.extend(check_identity(case, seed, variant, d, meta, base_config))
+    if stop_damping is None:
+        from feedingrobot.sim.model import load_config
+        stop_damping = load_config('configs/m2_controller.json')['stop']['damping_nm_s_per_rad']
     dt = VARIANTS[variant][0]
     n = len(d.get("tau_cmd", []))
     abort = case.family == "stop" and case.event in {"nan", "inf", "warning"}
@@ -207,7 +212,9 @@ def score(case: Case, seed, variant, data, meta, stop_damping=8.):
             if injected_contact:
                 continue
             check(d["contact_dist"][j] >= -.001, "penetration")
-            check(contact_allowed(phase, a, b, {"press_test": case.fixture}), "forbidden_contact")
+            row = {'geom1': None if a == 'None' else a, 'geom2': None if b == 'None' else b,
+                   'geom1_id': d['contact_geom1_id'][j], 'geom2_id': d['contact_geom2_id'][j]}
+            check(recorded_contact_allowed(phase, row, {"press_test": case.fixture}, meta['geometry_registry']), "forbidden_contact")
             if (a.startswith("bowl_") or b.startswith("bowl_")) and ({a,b} & {"spring_pad","plate_bottom","jaw_lip"}):
                 contact_ticks.append(k)
     valid = d["ft_valid"].astype(bool)
@@ -378,6 +385,8 @@ def score(case: Case, seed, variant, data, meta, stop_damping=8.):
                "moment_peak": float(np.nanmax(moment)), "tau_peak": np.max(np.abs(d["tau_cmd"]),axis=0).tolist(),
                "impulse": float(np.sum(finite_force)*dt), "events": events,
                "initial_qpos": d["initial_qpos"].tolist(), "initial_qvel": d["initial_qvel"].tolist()}
+    metrics.update(initial_source_identity=str(d['initial_source_identity'].item()),
+                   execution_id=str(d['execution_id'].item()), variant=variant)
     metrics["tracking_position_rms"]=rms(pe[moving]) if np.any(moving) else rms(pe)
     metrics["tracking_rotation_rms"]=rms(re[moving]) if np.any(moving) else rms(re)
     if case.family=="stiffness":metrics["stiffness_displacement"]=float(displacement)
@@ -389,6 +398,12 @@ def score(case: Case, seed, variant, data, meta, stop_damping=8.):
 
 def compare(left, right):
     failures = []
+    if left.get('execution_id') == right.get('execution_id'):
+        failures.append({'code': 'duplicate_execution'})
+    if left.get('initial_source_identity') != right.get('initial_source_identity'):
+        failures.append({'code': 'initial_pair:source'})
+    if left.get('variant') != 'A' or right.get('variant') not in {'B', 'C'}:
+        failures.append({'code': 'variant_pair'})
     for key, floor in (("position_rms",.0001),("rotation_rms",np.deg2rad(.05)),("tracking_position_rms",.0001),("tracking_rotation_rms",np.deg2rad(.05)),("force_peak",.02),("force_mean",.02),("moment_peak",.002),("tau_peak",.05),("impulse",1e-4)):
         a,b = np.asarray(left[key]),np.asarray(right[key])
         if np.any(np.abs(a-b)>np.maximum(.1*np.maximum(np.abs(a),np.abs(b)),floor)+1e-12):

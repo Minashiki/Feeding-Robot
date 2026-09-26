@@ -19,6 +19,10 @@ next_state, info = control_step(controller, guard)
 
 该入口负责实际力矩提交、步后测量、滤波/延迟更新和保护核验。STOP/RECOVER 请求立即进入 STOPPING，清空正常命令，关闭任务及零空间力矩，以独立 `stop.damping_nm_s_per_rad` 制动。重复停止不重置计时；STOPPING/STOPPED 拒绝新运动命令，只能 reset 重启。显式停止记录 stop_request，不伪造首故障。
 
+`control_step(controller, guard, phase="STOP")` 和 `RECOVER` 在上电接管期间也于当前控制区间生效。启动制动力矩仍从实际已施加值按原变化率爬升；真实的持续饱和等后续故障仍记录，不能因已请求停止而隐藏。
+
+M2 的接触保护在 controller.reset 时绑定当前模型的 geom ID、名称及 body 归属。未命名机械臂 geom 由实际 link body 识别；未知几何、错误 ID/名称组合以及未授权工具—机械臂接触均拒绝。M1 原有分组接口保持不变。
+
 非有限原始/补偿力样本不进入滤波和延迟队列，立即锁存 ABORTED；后续调用不推进物理时钟。合法滤波/延迟预热只标记 valid=false，不属于故障。estimated_kinematics 用逐子体历史速度差分计算惯性补偿，与 exact_model 分开输出；首样本 estimated_valid=false。
 
 `twist_world` 是世界系六维速度，前三维平移（m/s），后三维角速度（rad/s）。命令时间用场景回合时钟，不用墙钟，也不用可能落后一步的缓存。`command_time <= now < valid_until`，有效期最长 0.1 s。NaN 或 Inf 会取消命令并进入 `ABORTED`。相同时间戳只接受内容完全一致的重传，不能改 twist、阶段或截止时间。`now == valid_until` 时命令已经过期，当前控制区间直接走停止分支。

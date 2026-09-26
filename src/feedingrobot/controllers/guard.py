@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import mujoco
 
 from feedingrobot.sim.contacts import contact_pair, geom_group
 
@@ -31,6 +32,51 @@ _PLATE_DEFAULT = ("plate_bottom",)
 _MOUTH_DEFAULT = ("jaw_lip",)
 
 
+def geometry_registry(model):
+    """Resolve unnamed robot geoms by body ownership, never by an unknown name."""
+    rows = []
+    for gid in range(model.ngeom):
+        body = int(model.geom_bodyid[gid])
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gid)
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body)
+        ancestors = []
+        cursor = body
+        while cursor:
+            ancestors.append(mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, cursor))
+            cursor = int(model.body_parentid[cursor])
+        if 'tool_mount' in ancestors:
+            group = 'spoon'
+        elif body_name in {f'link{i}' for i in range(8)}:
+            group = 'arm'
+        elif 'food' in ancestors:
+            group = 'food'
+        elif 'plate' in ancestors:
+            group = 'plate'
+        elif 'head' in ancestors:
+            group = 'mouth'
+        elif body == 0 and name in {'table', 'floor'}:
+            group = name
+        elif body_name == 'spring_slider' and name == 'spring_pad':
+            group = 'fixture'
+        else:
+            group = 'unknown'
+        rows.append({'id': gid, 'name': name, 'body': body_name, 'group': group})
+    return rows
+
+
+def recorded_contact_allowed(phase, row, context, registry):
+    groups = []
+    for side in (1, 2):
+        gid = row.get(f'geom{side}_id')
+        if not isinstance(gid, (int, np.integer)) or not 0 <= gid < len(registry):
+            return False
+        item = registry[int(gid)]
+        if row.get(f'geom{side}') != item['name']:
+            return False
+        groups.append(item['group'])
+    return contact_allowed(phase, row.get('geom1'), row.get('geom2'), {**context, 'groups': groups})
+
+
 def gear_of(phase: str) -> str:
     if phase not in GEAR_OF:
         raise KeyError(phase)
@@ -46,12 +92,14 @@ def contact_allowed(phase: str, geom_a: str, geom_b: str, context: dict | None =
     a = geom_a or ""
     b = geom_b or ""
     names = {a, b}
-    ga, gb = geom_group(a), geom_group(b)
+    ga, gb = ctx.get('groups', tuple('unknown' if geom_group(n) == 'arm' else geom_group(n) for n in (a, b)))
     groups = {ga, gb}
     if names & {"spring_pad"} or any(name.startswith("spring_") or name.startswith("test_") for name in names):
         if not ctx.get("press_test"):
             return False
         return bool(names & bowl) and "spring_pad" in names
+    if 'unknown' in groups:
+        return False
     if groups == {"food", "spoon"} or groups == {"food", "plate"}:
         return True
     if groups == {"food", "mouth"}:
@@ -62,7 +110,7 @@ def contact_allowed(phase: str, geom_a: str, geom_b: str, context: dict | None =
     if not robot:
         return True
     if groups <= {"arm", "spoon"}:
-        return True
+        return False
     if "arm" in groups and groups & {"table", "plate", "mouth", "floor"}:
         return False
     if groups == {"spoon", "table"}:
@@ -91,7 +139,11 @@ class Guard:
         self.stop_speed = float(stop["speed_rad_s"])
         self.stop_within_s = float(stop["within_s"])
         self.stop_hold_s = float(stop["hold_s"])
+        self.registry = None
         self.reset()
+
+    def bind_model(self, model):
+        self.registry = geometry_registry(model)
 
     def reset(self) -> None:
         self.status = "RUNNING"
@@ -174,13 +226,14 @@ class Guard:
                         measured = q.tolist()
                     if reason is None:
                         for row in state.get("contacts") or []:
-                            if not self.allowed(phase, row.get("geom1"), row.get("geom2")):
-                                if geom_group(row.get("geom1")) in {"arm", "spoon"} or geom_group(row.get("geom2")) in {"arm", "spoon"}:
-                                    reason = "forbidden_contact"
-                                    pair = contact_pair(row["group1"], row["group2"])
-                                    geoms = (row.get("geom1"), row.get("geom2"))
-                                    measured = float(row["dist"])
-                                    break
+                            allowed = (recorded_contact_allowed(phase, row, self.context, self.registry)
+                                       if self.registry is not None else self.allowed(phase, row.get("geom1"), row.get("geom2")))
+                            if not allowed:
+                                reason = "forbidden_contact"
+                                pair = contact_pair(row.get("group1", "unknown"), row.get("group2", "unknown"))
+                                geoms = (row.get("geom1"), row.get("geom2"))
+                                measured = float(row["dist"])
+                                break
                     if reason is None and info.get("command_expired"):
                         reason = "command_expired"
                     if reason is None and info.get("observation_invalid"):

@@ -15,7 +15,7 @@ def assess_m2(run: Path, scope: str, check_workspace: bool) -> dict:
         header = json.loads((run / "run.json").read_text())
     except (OSError, ValueError):
         header = {}
-    if header.get("schema_version") == "m2-full-v1":
+    if header.get("schema_version") in {"m2-full-v1", "m2-full-v2"}:
         from feedingrobot.controllers.full_acceptance import evaluate
         verdict = evaluate(run, check_workspace=check_workspace, calibration=header.get("stage") == "calibration")
         if scope != "full" or header.get("stage") != "full":
