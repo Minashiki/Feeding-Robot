@@ -268,30 +268,8 @@ def _sha256(path: Path) -> str:
 
 
 def collect_inputs(root: Path | None = None) -> dict:
-    """Independent input set. Does not read a report's own file list."""
-    root = repo_root() if root is None else Path(root)
-    files = list(_tracked_files(root, root / "configs" / "m1_scene.json"))
-    for folder in (root / "src" / "feedingrobot" / "controllers",):
-        found = [path.resolve() for path in folder.rglob("*.py") if path.is_file()]
-        if not found:
-            raise RuntimeError(f"missing required input directory {folder}")
-        files.extend(found)
-    for rel in ("configs/m2_controller.json", "configs/m2_acceptance.json", "assets/tests/m2_spring_surface.xml"):
-        path = (root / rel).resolve()
-        if not path.is_file():
-            raise RuntimeError(f"missing required input {rel}")
-        files.append(path)
-    missing = sorted({str(path.relative_to(root)) for path in files if not path.is_file()})
-    if missing:
-        raise RuntimeError("missing required input " + missing[0])
-    rows = [{"path": str(path.resolve().relative_to(root)), "sha256": _sha256(path.resolve())} for path in sorted(set(files))]
-    digest = hashlib.sha256()
-    for row in rows:
-        digest.update(row["path"].encode())
-        digest.update(b"\0")
-        digest.update(row["sha256"].encode())
-        digest.update(b"\n")
-    return {"files": rows, "aggregate_sha256": digest.hexdigest()}
+    from feedingrobot.validation.m2.provenance import collect_inputs as collect
+    return collect(root)
 
 
 def _load(path: Path):

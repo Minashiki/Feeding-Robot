@@ -7,29 +7,10 @@ import mujoco
 
 from feedingrobot.sim.contacts import contact_pair, geom_group
 
-PHASES = (
-    "SELECT",
-    "ACQUIRE",
-    "TRANSPORT",
-    "WAIT_READY",
-    "APPROACH",
-    "TRANSFER",
-    "RETRACT",
-    "RECOVER",
-    "STOP",
+from feedingrobot.controllers.contracts import (
+    PHASES, FREE_PHASES, MOUTH_PHASES, GEAR_OF,
+    BOWL_GEOMS as _BOWL_DEFAULT, PLATE_GEOMS as _PLATE_DEFAULT, MOUTH_GEOMS as _MOUTH_DEFAULT,
 )
-FREE_PHASES = ("SELECT", "TRANSPORT", "WAIT_READY")
-MOUTH_PHASES = ("APPROACH", "TRANSFER", "RETRACT")
-GEAR_OF = {name: "FREE" for name in FREE_PHASES}
-GEAR_OF["ACQUIRE"] = "ACQUIRE"
-for _name in MOUTH_PHASES:
-    GEAR_OF[_name] = "MOUTH"
-GEAR_OF["RECOVER"] = "STOP"
-GEAR_OF["STOP"] = "STOP"
-
-_BOWL_DEFAULT = ("bowl_bottom", "bowl_back", "bowl_left", "bowl_right", "bowl_front")
-_PLATE_DEFAULT = ("plate_bottom",)
-_MOUTH_DEFAULT = ("jaw_lip",)
 
 
 def geometry_registry(model):

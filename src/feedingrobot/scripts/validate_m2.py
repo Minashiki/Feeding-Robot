@@ -180,6 +180,9 @@ def main():
         "adversarial_returncode": adv.returncode,
     }
     (out / "report.json").write_text(json.dumps(report, indent=2))
+    if verdict["fixes_passed"]:
+        from feedingrobot.validation.m2.legacy import seal_execution
+        seal_execution(out)
     print(json.dumps({"pytest": proc.returncode, "adversarial": adv.returncode, "output": str(out), "fixes_passed": verdict["fixes_passed"], "m3_ready": False, "reasons": verdict["reasons"][:12]}, indent=2))
     if not verdict["fixes_passed"]:
         raise SystemExit(1)

@@ -36,3 +36,5 @@ M2 的接触保护在 controller.reset 时绑定当前模型的 geom ID、名称
 reset 后力矩从给定的 `tau_applied`（场景复位后为 0）按变化率爬升，最多 1 s。这段时间不积分任务 twist。步后 observe 发现的故障从下一控制区间起改为 bias 加关节阻尼，不再跟踪旧参考。`rho <= 0.01` 在当次 `compute` 内锁存 `reason="singularity"`，并在同一区间进入这套受控停止：取消命令、重新锚定一次、清空任务历史、刚度和阻尼有效值为 0、`tau_task` 与 `tau_null` 为 0、`tau_raw = bias - d_stop·dq`，其中 d_stop 由独立停车标定冻结。停止优先于上电和档位过渡。相位日志保持触发时的阶段。`0.01 < rho < 0.05` 只平滑缩小命令，不紧急停止。非有限雅可比或失败的 SVD 进入 `ABORTED`，不用 `rho=0` 假装通过停止。停止计时从该故障区间的起点开始。rho 恢复后不会自动清除故障；只有 reset 清除。复位后若仍然奇异，下一次 compute 会再次锁存。已经锁存的其他故障原因保持不变。`ABORTED` 表示非有限状态或 MuJoCo warning，调用方应停止仿真。
 
 `info` 中的 `ft_*` 字段是步后样本上的补偿结果，其 sample_tick/sample_time 对应 next_state。控制计算只使用上一份已可用缓存。保护使用未延迟的 `compensated_wrench_tcp`。`delivered_wrench_tcp` 是低通并延迟后的观测，不能当作即时保护。
+
+步进前的 `finite=false`、已有 MuJoCo warning 或控制所需状态/原始 wrench 非有限值，在任何 `mj_forward` 前拒绝：锁存 ABORTED、取消命令、`apply=false`，当前及后续调用不推进 tick/time。`compute` 与 `control_step` 使用同一预检。未知 phase 在修改状态前抛出 `ValueError`；None 保持原义。完整验收与 full-v3 证据格式见 `docs/m2_acceptance.md`。

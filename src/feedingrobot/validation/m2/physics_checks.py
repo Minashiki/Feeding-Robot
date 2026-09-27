@@ -41,6 +41,8 @@ def check_physics(data, case):
             _,wrench=world_and_tcp_wrench(data['raw_wrench_sensor'][k],s.site_xmat[ft].reshape(3,3),s.site_xpos[ft],p,scene.wrench_sign)
             maxima['wrench_transform']=max(maxima['wrench_transform'],float(np.max(np.abs(wrench-data['ft_tcp_wrench_world'][k-1]))))
         if k==n:continue
+        maxima['external_body_com'] = max(maxima.get('external_body_com', 0.), float(np.max(
+            np.abs(s.xipos[ix.tool_body_id] - data['external_body_com_before'][k]))))
         bias=s.qfrc_bias[cols]
         maxima['bias']=max(maxima['bias'],float(np.max(np.abs(bias-data['tau_bias'][k]))))
         if data['execution'][k]=='stop':continue
@@ -57,6 +59,25 @@ def check_physics(data, case):
         a=js@inverse
         regularizer=epsilon*max(float(np.trace(a)/6),1e-4)
         jbar=inverse@np.linalg.inv(a+regularizer*np.eye(6))
+        prediction = jbar @ (scale @ data['v_hist'][k])
+        if not np.allclose(data['qdot_pred'][k], prediction, atol=1e-9, rtol=0) and not any(r['code'] == 'reference:qdot_pred' for r in reasons):
+            reasons.append({'code': 'reference:qdot_pred', 'tick': k})
+        candidate_velocity = jbar @ (scale @ data['candidate_twist'][k])
+        beta = 1.
+        ranges = m.jnt_range[ix.arm_joint_ids]
+        for joint, speed in enumerate(candidate_velocity):
+            if abs(speed) < 1e-12:
+                continue
+            room = (ranges[joint, 1] - data['q'][k, joint] if speed > 0
+                    else data['q'][k, joint] - ranges[joint, 0])
+            allowed = .4 * np.clip((room - .05) / .05, 0., 1.)
+            beta = min(beta, allowed / abs(speed))
+        if data['execution'][k] not in {'run', 'zero'}:
+            beta = 1.
+        if abs(float(data['beta'][k]) - beta) > 1e-9 and not any(r['code'] == 'reference:beta' for r in reasons):
+            reasons.append({'code': 'reference:beta', 'tick': k})
+        if abs(float(data['rho'][k]) - rho) > 1e-9 and not any(r['code'] == 'physics:rho' for r in reasons):
+            reasons.append({'code': 'physics:rho', 'tick': k})
         null=(np.eye(7)-jbar@js).T@(fraction*np.clip(2*(q0-data['q'][k])-observed[k],-2,2))
         raw=bias+task+null
         for key,value in (('task',task),('null',null),('raw',raw)):
@@ -67,9 +88,8 @@ def check_physics(data, case):
 
 
 def check_sensor_chain(data,case,seed,dt):
-    from feedingrobot.controllers.wrench import tool_body_ids
     scene=FeedingScene('configs/m1_scene.json')
-    bodies=tool_body_ids(scene.model,scene.index.tool_body_id)
+    bodies=tool_bodies(scene.model,scene.index.tool_body_id)
     masses=scene.model.body_mass[bodies]
     v=data['ft_tool_velocity']
     acceleration=np.diff(np.concatenate([data['initial_tool_velocity'][None],v]),axis=0)/dt
@@ -83,6 +103,15 @@ def check_sensor_chain(data,case,seed,dt):
     estimate=data['ft_tcp_wrench_world']-data['ft_bias_wrench_tcp']-predicted
     valid=np.asarray(data['ft_estimated_valid'],dtype=bool)
     reasons=[]
+    # The finite-difference channel ties recorded acceleration to actual motion.
+    # Use the existing exact-model force/moment error budget, never fit a new one.
+    dynamic_difference = predicted - data['ft_tool_load_predicted']
+    for label, columns, mean_limit, peak_limit in (
+        ('force', slice(0, 3), .05, .15), ('moment', slice(3, 6), .005, .015),
+    ):
+        difference = np.linalg.norm(dynamic_difference[valid, columns], axis=1)
+        if len(difference) and (np.sqrt(np.mean(difference**2)) > mean_limit or np.max(difference) > peak_limit):
+            reasons.append({'code': 'tool_motion:' + label, 'observed': float(np.max(difference)), 'limit': peak_limit})
     if not np.allclose(data['ft_estimated_kinematics'][valid],estimate[valid],atol=1e-8,rtol=1e-7):reasons.append({'code':'estimated_chain'})
     compensated=data['ft_tcp_wrench_world']-data['ft_bias_wrench_tcp']-data['ft_tool_load_predicted']
     finite=np.all(np.isfinite(compensated),axis=1)
@@ -107,3 +136,62 @@ def check_sensor_chain(data,case,seed,dt):
         if delivery>=0 and not np.allclose(data['ft_delivered_wrench_tcp'][k],observed[delivery],atol=1e-9,rtol=1e-7):
             reasons.append({'code':'delivery_chain','tick':k+1});break
     return reasons
+
+
+def tool_bodies(model, root):
+    bodies = []
+    for body in range(1, model.nbody):
+        parent = body
+        while parent and parent != root:
+            parent = int(model.body_parentid[parent])
+        if parent == root:
+            bodies.append(body)
+    return bodies
+
+
+def check_tool_dynamics(data):
+    """COM acceleration from differentiated Jacobians and sampled joint acceleration."""
+    scene = FeedingScene('configs/m1_scene.json')
+    model, state, ix = scene.model, scene.data, scene.index
+    bodies = tool_bodies(model, ix.tool_body_id)
+    n = len(data['tau_cmd'])
+    shapes = {'tool_acceleration': (n, len(bodies), 6),
+              'ft_tool_velocity': (n, len(bodies), 6),
+              'ft_tool_com': (n, len(bodies), 3),
+              'ft_tool_inertia': (n, len(bodies), 3, 3)}
+    errors = [{'code': 'shape:' + key} for key, shape in shapes.items()
+              if key not in data or data[key].shape != shape]
+    if errors:
+        return errors
+    plus, minus = mujoco.MjData(model), mujoco.MjData(model)
+    jp, jr = np.zeros((3, model.nv)), np.zeros((3, model.nv))
+    maxima = {key: 0. for key in ('tool_com', 'tool_inertia', 'tool_velocity', 'tool_acceleration', 'tool_load')}
+    h = 1e-5
+    columns = ix.arm_dof_adr
+    for k in range(n):
+        q, dq, ddq = data['q'][k + 1], data['physical_dq'][k + 1], data['arm_acceleration'][k]
+        for sample, offset in ((state, 0.), (plus, h), (minus, -h)):
+            sample.qpos[ix.arm_qpos_adr] = q + offset * dq
+            mujoco.mj_kinematics(model, sample)
+            mujoco.mj_comPos(model, sample)
+        predicted = np.zeros(6)
+        for j, body in enumerate(bodies):
+            jacobians = []
+            for sample in (state, plus, minus):
+                mujoco.mj_jacBodyCom(model, sample, jp, jr, body)
+                jacobians.append(np.vstack([jr[:, columns], jp[:, columns]]))
+            velocity = jacobians[0] @ dq
+            acceleration = jacobians[0] @ ddq + (jacobians[1] - jacobians[2]) @ dq / (2 * h)
+            rotation = state.ximat[body].reshape(3, 3)
+            inertia = rotation @ np.diag(model.body_inertia[body]) @ rotation.T
+            com = state.xipos[body]
+            force = model.body_mass[body] * (model.opt.gravity - acceleration[3:])
+            moment = (np.cross(com - data['tcp_pos'][k + 1], force)
+                      - inertia @ acceleration[:3] - np.cross(velocity[:3], inertia @ velocity[:3]))
+            predicted += np.r_[force, moment]
+            for field, value in [('tool_com', com), ('tool_inertia', inertia), ('tool_velocity', velocity), ('tool_acceleration', acceleration)]:
+                recorded = data[field if field == 'tool_acceleration' else 'ft_' + field][k, j]
+                maxima[field] = max(maxima[field], float(np.max(np.abs(value - recorded))))
+        maxima['tool_load'] = max(maxima['tool_load'], float(np.max(np.abs(predicted - data['ft_tool_load_predicted'][k]))))
+    return [{'code': 'physics:' + field, 'observed': error, 'limit': 1e-7}
+            for field, error in maxima.items() if error > 1e-7]

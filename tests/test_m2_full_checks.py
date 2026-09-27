@@ -2,9 +2,9 @@
 import numpy as np
 import pytest
 
-from feedingrobot.controllers.full_checks import expected_stimulus
-from feedingrobot.controllers.full_spec import Case, cases, manifest
-from feedingrobot.controllers.full_runner import target
+from feedingrobot.validation.m2.reference_checks import expected_stimulus
+from feedingrobot.validation.m2.spec import Case, cases, manifest
+from feedingrobot.validation.m2.runner import target
 
 
 def test_manifest_contains_formal_seeds_and_all_pairs():
@@ -26,8 +26,9 @@ def test_independent_target_schedule_matches_generator(family):
 
 
 def test_contact_stop_expiry_keeps_fixture_direction(tmp_path):
-    from feedingrobot.controllers.full_runner import run_group
-    from feedingrobot.controllers.full_checks import score, compare
+    from feedingrobot.validation.m2.runner import run_group
+    from feedingrobot.validation.m2.package import compare
+    from feedingrobot.validation.m2.checks import score
     from feedingrobot.sim.model import load_config
     case=Case('stop',axis=1,sign=-1,event='expired',context='spring')
     traces=run_group(case,0,load_config('configs/m2_controller.json'),str(tmp_path))

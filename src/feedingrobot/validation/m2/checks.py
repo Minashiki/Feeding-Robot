@@ -3,16 +3,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from feedingrobot.controllers.full_spec import Case, VARIANTS
-from feedingrobot.controllers.guard import recorded_contact_allowed, gear_of
+from feedingrobot.validation.m2.spec import Case, VARIANTS, SCHEMA, TAU_MAX, RANGES, GEARS
+from feedingrobot.validation.m2.contact_checks import recorded_contact_allowed
+from feedingrobot.controllers.contracts import GEAR_OF
+from feedingrobot.validation.m2.reference_checks import expected_stimulus
 
-TAU_MAX = np.array([87., 87., 87., 87., 12., 12., 12.])
-RANGES = np.array([[-2.8973, 2.8973], [-1.7628, 1.7628], [-2.8973, 2.8973],
-                   [-3.0718, -.0698], [-2.8973, 2.8973], [-.0175, 3.7525], [-2.8973, 2.8973]])
-GEARS = {"FREE": (.05, .3, .02, .13962634, 8., .8),
-         "ACQUIRE": (.02, .15, .01, .08726646, 4., .4),
-         "MOUTH": (.01, .1, .005, .05235988, 2., .2),
-         "STOP": (0., 0., .02, .13962634, 8., .8)}
 
 
 def angles(a, b):
@@ -30,72 +25,48 @@ def envelope(values, floor):
     return rms(windows[-1]) <= 1.1*rms(windows[0]) + floor
 
 
-def expected_stimulus(case, times):
-    """Independent analytic schedule, not imported from the command generator."""
-    published = np.floor((times+1e-10)/.05)*.05
-    def displacement(t):
-        out = np.zeros((len(t),6))
-        def blend(start, duration):
-            u = np.clip((t-start)/duration,0,1)
-            return u*u*u*(10-15*u+6*u*u)
-        if case.family == "step":
-            out[:,case.axis] = case.sign*(.01 if case.axis<3 else np.pi/36)*blend(1,1)
-        elif case.family in {"circle","loaded_circle"}:
-            a = .5*np.pi*np.clip(t-1,0,8)
-            out[:,0],out[:,1] = .01*(np.cos(a)-1), .01*np.sin(a)
-        elif case.family == "sine":
-            out[:,3+case.axis] = np.pi/60*np.sin(.5*np.pi*np.clip(t-1,0,8))
-        elif case.family in {"spring","press"}:
-            out[:,1] = -np.clip((t-1)*.002,0,.0065)+np.clip((t-6.25)*.002,0,.0065)
-        elif case.family == "carry": out[:,0] = .01*(blend(1,1)-blend(4,1))
-        elif case.family == "plate": out[:,2] = -.008*(blend(1,12)-blend(15,12))
-        elif case.family == "mouth": out[:,0] = .006*(blend(1,12)-blend(15,12))
-        return out
-    supplied = (displacement(published+.05)-displacement(published))/.05
-    external = np.zeros_like(supplied)
-    phase = np.full(len(times),"TRANSPORT",dtype="U16")
-    if case.family == "wall": supplied[:,1] = np.where((published>=1)&(published<3),-.02,0)
-    if case.family == "stop":
-        end = 1.42 if case.event in {"STOP","RECOVER"} else 1.42+(times[1]-times[0])*(.5 if case.event == "expired" else 1.5)
-        supplied[:,case.axis] = np.where((published>=.8)&(times<end),case.sign*(.04 if case.axis<3 else .2),0)
-        if case.event == "singularity":supplied[:]=0
-        if case.event in {"STOP","RECOVER"}: phase[times>=1.42-1e-10]=case.event
-        if case.event == "wrench": external[np.abs(times-1.42)<1e-10,0] = 8.1
-    if case.family in {"static","loaded_circle","stiffness"}:
-        external[times>=1.-1e-10,case.axis] = case.sign*case.load
-    if case.family == "pulse":
-        external[(times>=1.5-1e-10)&(times<1.65-1e-10),case.axis] = case.sign*(1. if case.axis<3 else .02)
-    if case.family == "plate": phase[(published>=.5)&(published<28.)]="ACQUIRE"
-    if case.family == "mouth": phase[:]="APPROACH"
-    return supplied, external, phase
-
 
 def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=None):
     d = {key: np.asarray(value) for key, value in data.items()}
     failures = []
+    seen = set()
+    def describe(rows):
+        return [{'case_id': case.manifest(seed, variant)['case_id'], 'seed': seed, 'variant': variant,
+                 'field': row['code'].split(':', 1)[-1], **row} for row in rows]
     def check(ok, code, observed=None):
-        if not bool(ok):
+        if not bool(ok) and code not in seen:
+            seen.add(code)
             failures.append({"code": code, "observed": observed})
     expected = case.manifest(seed, variant)
+    check(meta.get('schema_version') == SCHEMA, 'trace_schema')
     for key, value in expected.items():
         check(meta.get(key) == value, "identity:"+key)
-    from feedingrobot.controllers.full_identity import check_identity
+    from feedingrobot.validation.m2.provenance import check_identity
     failures.extend(check_identity(case, seed, variant, d, meta, base_config))
     if stop_damping is None:
         from feedingrobot.sim.model import load_config
         stop_damping = load_config('configs/m2_controller.json')['stop']['damping_nm_s_per_rad']
     dt = VARIANTS[variant][0]
     n = len(d.get("tau_cmd", []))
+    from feedingrobot.validation.m2.contact_checks import check_contacts
+    contact_failures = check_contacts(d)
+    if contact_failures:
+        return describe(failures + contact_failures), {}
     abort = case.family == "stop" and case.event in {"nan", "inf", "warning"}
     expected_n = round(1.42/dt)+1 if abort else round(case.duration/dt)
     check(n == expected_n, "sample_count", n)
     if not n:
-        return failures, {}
+        return describe(failures), {}
     state_shapes = {"q": (n+1, 7), "dq": (n+1, 7), "tcp_pos": (n+1, 3), "tcp_mat": (n+1, 3, 3),
                     "physical_dq": (n+1,7),
                     "raw_wrench_sensor": (n+1, 6), "qfrc_actuator": (n+1, 7), "tcp_twist": (n+1, 6),
                     "food_pos": (n+1, 3), "food_quat": (n+1, 4), "t": (n+1,), "tick": (n+1,)}
     interval_shapes = {"p_ref": (n,3), "r_ref": (n,3,3), "v_ref": (n,6), "external": (n,9), "supplied": (n,6),
+                       "p_ref_before": (n,3), "r_ref_before": (n,3,3), "command_times": (n,2),
+                       "arm_acceleration": (n,7), "candidate_twist": (n,6), "beta": (n,),
+                       "external_body_com_before": (n,3), "applied_wrench_com": (n,6),
+                       "v_hist": (n,6), "qdot_pred": (n,7), "scale": (n,), "reanchored": (n,),
+                       "reference_correction_rot": (n,), "correction_reason": (n,), "constraint_reset": (n,),
                        "tau_before": (n,7), "tau_cmd": (n,7), "tau_raw": (n,7), "tau_task": (n,7), "tau_null": (n,7), "tau_bias": (n,7),
                        "ft_compensated_wrench_tcp": (n,6), "ft_estimated_kinematics": (n,6), "ft_delivered_wrench_tcp": (n,6),
                        "ft_valid": (n,), "ft_estimated_valid": (n,), "ft_sample_time": (n,), "ft_sample_tick": (n,),
@@ -103,12 +74,29 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
     for key, shape in {**state_shapes, **interval_shapes}.items():
         check(key in d and d[key].shape == shape, "shape:"+key)
     if any(f["code"].startswith("shape:") for f in failures):
-        return failures, {}
+        return describe(failures), {}
     for key in ("ft_tcp_wrench_world","ft_bias_wrench_tcp","ft_tool_load_predicted","ft_tool_velocity","ft_tool_com","ft_tool_inertia","ft_tcp_position","initial_tool_velocity","initial_compensated","contact_pos","contact_frame","contact_force_contact","contact_geom1_id","contact_geom2_id"):
         check(key in d,"missing:"+key)
     if failures:
-        return failures, {}
+        return describe(failures), {}
+    from feedingrobot.validation.m2.contact_checks import check_tool_balance
+    failures.extend(check_tool_balance(d, meta['geometry_registry']))
     fault_row = round(1.42/dt)
+    if case.family == 'stop' and case.event in {'contact', 'penetration'}:
+        start, end = d['contact_offsets'][fault_row:fault_row+2]
+        injected = [j for j in range(start, end)
+                    if d['contact_geom1'][j] == 'tool_handle' and d['contact_geom2'][j] == 'plate_bottom']
+        check(len(injected) == 1, 'contact_stimulus', len(injected))
+        if len(injected) == 1:
+            j = injected[0]
+            ids = {row['name']: row['id'] for row in meta['geometry_registry']}
+            check(d['contact_geom1_id'][j] == ids['tool_handle']
+                  and d['contact_geom2_id'][j] == ids['plate_bottom']
+                  and abs(d['contact_dist'][j] - (-.002 if case.event == 'penetration' else 0.)) < 1e-12
+                  and np.array_equal(d['contact_frame'][j], np.eye(3).ravel())
+                  and not np.any(d['contact_wrench_contact'][j])
+                  and np.allclose(d['contact_pos'][j], d['tcp_pos'][fault_row+1], atol=1e-12, rtol=0),
+                  'contact_stimulus')
     expected_command, expected_external, expected_phase = expected_stimulus(case,np.arange(n)*dt)
     if case.fixture:
         normal = np.asarray(meta.get("normal",[]))
@@ -120,7 +108,8 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
     if case.event == "lever": points[:,0] += .03
     check(np.allclose(d["external"][:,6:][np.any(expected_external!=0,axis=1)],points[np.any(expected_external!=0,axis=1)],atol=1e-9), "load_point")
     check(np.array_equal(d["phase_k"],expected_phase), "phase_stimulus")
-    from feedingrobot.controllers.v4fields import rebuild_gain_path
+    from feedingrobot.validation.m2.reference_checks import rebuild_gain_path, check_analytic_motion
+    failures.extend(check_analytic_motion(case, d))
     gain = rebuild_gain_path(expected_phase,dt)
     if "K" in gain:
         expected_k, expected_d = gain["K"],gain["D"]
@@ -187,12 +176,12 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
     offsets = d["contact_offsets"]
     check(offsets.dtype.kind in "iu" and offsets.shape == (n+1,) and offsets[0] == 0 and np.all(np.diff(offsets)>=0) and offsets[-1] == len(d["contact_dist"]), "contact_offsets")
     if any(f["code"] == "contact_offsets" for f in failures):
-        return failures, {}
+        return describe(failures), {}
     contact_ticks = []
     for k in range(n):
         phase = str(d["phase_k"][k])
         try:
-            limits = GEARS[gear_of(phase)]
+            limits = GEARS[GEAR_OF[phase]]
         except KeyError:
             check(False, "phase"); continue
         stopping = d["execution"][k] == "stop"
@@ -374,10 +363,13 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
         check(not any(k*dt>=28. for k in contact_ticks), "bridge_exit")
     finite_force = np.nan_to_num(force)
     if not any(row["code"].startswith(("nonfinite:","shape:","rotation:")) for row in failures):
-        from feedingrobot.controllers.full_physics import check_physics,check_sensor_chain
+        from feedingrobot.validation.m2.physics_checks import check_physics,check_sensor_chain,check_tool_dynamics
+        from feedingrobot.validation.m2.reference_checks import check_reference_path
         try:
             failures.extend(check_physics(d,case))
             failures.extend(check_sensor_chain(d,case,seed,dt))
+            failures.extend(check_tool_dynamics(d))
+            failures.extend(check_reference_path(d,meta['effective_controller'],dt))
         except (ValueError,KeyError,IndexError,TypeError,np.linalg.LinAlgError) as error:
             check(False,"physical_evidence",str(error))
     metrics = {"position_rms": rms(pe[tail]) if np.any(tail) else rms(pe), "rotation_rms": rms(re[tail]) if np.any(tail) else rms(re),
@@ -388,32 +380,18 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
     metrics.update(initial_source_identity=str(d['initial_source_identity'].item()),
                    execution_id=str(d['execution_id'].item()), variant=variant)
     metrics["tracking_position_rms"]=rms(pe[moving]) if np.any(moving) else rms(pe)
+    from feedingrobot.validation.m2.contact_checks import tool_contact_wrench
+    try:
+        contact_wrench = tool_contact_wrench(d, meta['geometry_registry'])
+        contact_force = np.linalg.norm(contact_wrench[:, :3], axis=1)
+        metrics.update(contact_force_peak=float(np.max(contact_force)),
+                       contact_moment_peak=float(np.max(np.linalg.norm(contact_wrench[:, 3:], axis=1))),
+                       contact_impulse=float(np.sum(contact_force) * dt))
+    except ValueError:
+        check(False, 'contact_geom_identity')
     metrics["tracking_rotation_rms"]=rms(re[moving]) if np.any(moving) else rms(re)
     if case.family=="stiffness":metrics["stiffness_displacement"]=float(displacement)
     if case.family in {"spring","press"}:metrics["contact_force_mean"]=mean
     # Keep the first occurrence of each failed predicate, with its measured value.
     unique = {row["code"]:row for row in reversed(failures)}
-    return list(unique.values()), metrics
-
-
-def compare(left, right):
-    failures = []
-    if left.get('execution_id') == right.get('execution_id'):
-        failures.append({'code': 'duplicate_execution'})
-    if left.get('initial_source_identity') != right.get('initial_source_identity'):
-        failures.append({'code': 'initial_pair:source'})
-    if left.get('variant') != 'A' or right.get('variant') not in {'B', 'C'}:
-        failures.append({'code': 'variant_pair'})
-    for key, floor in (("position_rms",.0001),("rotation_rms",np.deg2rad(.05)),("tracking_position_rms",.0001),("tracking_rotation_rms",np.deg2rad(.05)),("force_peak",.02),("force_mean",.02),("moment_peak",.002),("tau_peak",.05),("impulse",1e-4)):
-        a,b = np.asarray(left[key]),np.asarray(right[key])
-        if np.any(np.abs(a-b)>np.maximum(.1*np.maximum(np.abs(a),np.abs(b)),floor)+1e-12):
-            failures.append({"code":"convergence:"+key,"left":a.tolist(),"right":b.tolist()})
-    for key in ("initial_qpos","initial_qvel"):
-        if not np.array_equal(left[key],right[key]): failures.append({"code":"initial_pair:"+key})
-    if set(left["events"]) != set(right["events"]):
-        failures.append({"code":"event_pair"})
-    else:
-        for event in left["events"]:
-            if abs(left["events"][event]-right["events"][event]) > .020+1e-12:
-                failures.append({"code":"event_time:"+event})
-    return failures
+    return describe(list(unique.values())), metrics

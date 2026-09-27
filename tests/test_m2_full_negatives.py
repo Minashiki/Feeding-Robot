@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from feedingrobot.controllers.full_negatives import NEGATIVES, check_negatives, run_negative
+from feedingrobot.validation.m2.negatives import NEGATIVES, check_negatives, run_negative
 
 
 def test_boolean_negative_summary_is_rejected(tmp_path):
@@ -16,13 +16,13 @@ def test_boolean_negative_summary_is_rejected(tmp_path):
 def test_full_counterexample_pipeline(tmp_path, monkeypatch):
     """Exercise every mutation on real traces; only the unrelated M1/legacy prerequisite is stubbed."""
     import shutil
-    from feedingrobot.controllers import full_acceptance as a, acceptance
-    from feedingrobot.controllers.full_contracts import CONFIG_PATHS
-    from feedingrobot.controllers.full_runner import run_group
-    from feedingrobot.controllers.full_spec import Case, SCHEMA
-    from feedingrobot.controllers.full_negatives import negative_nodes
+    from feedingrobot.validation.m2 import package as a, legacy as acceptance
+    from feedingrobot.validation.m2.provenance import CONFIG_PATHS
+    from feedingrobot.validation.m2.runner import run_group
+    from feedingrobot.validation.m2.spec import Case, SCHEMA
+    from feedingrobot.validation.m2.negatives import negative_nodes
     from feedingrobot.sim.model import repo_root
-    cases = [Case('hold'), Case('stop', event='nan'), Case('stop', axis=1, sign=-1, event='expired', context='spring')]
+    cases = [Case('stop', event='contact'), Case('circle'), Case('sine'), Case('plate'), Case('hold'), Case('stop', event='nan'), Case('stop', axis=1, sign=-1, event='expired', context='spring')]
     monkeypatch.setattr(a, 'cases', lambda: cases)
     monkeypatch.setattr(a, 'CALIBRATION_SEEDS', (0,))
     monkeypatch.setattr(a, 'FORMAL_SEEDS', (3, 4))
@@ -69,6 +69,8 @@ def test_full_counterexample_pipeline(tmp_path, monkeypatch):
     write(source/'negative_execution.json',execution(negative_nodes(),source.name+'-negatives'))
     assert check_negatives(source)==[]
     assert not a.evaluate(source)['m3_ready']  # staged packages never release
+    completed = a.finalize(source)
+    assert completed['scope_passed'] and completed['m3_ready'], completed['reasons'][:10]
     payload['results'][0]['actual']=[]
     write(source/'negative_results.json',payload)
     assert check_negatives(source)
@@ -77,7 +79,7 @@ def test_full_counterexample_pipeline(tmp_path, monkeypatch):
 if os.environ.get('M2_FULL_PACKAGE'):
     @pytest.mark.parametrize('name', list(NEGATIVES))
     def test_full_negative(name):
-        from feedingrobot.controllers.full_acceptance import package_identity
+        from feedingrobot.validation.m2.package import package_identity
         package = Path(os.environ['M2_FULL_PACKAGE'])
         row = run_negative(package, name)
         assert row['rejected'] and row['source_unchanged']

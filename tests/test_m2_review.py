@@ -15,7 +15,7 @@ from tests.m2_support import load_m2_config, place_arm, start_controller
 @pytest.mark.parametrize('elapsed', [0., .02])
 @pytest.mark.parametrize('pose', [0, 1, 2])
 def test_stop_during_takeover(phase, variant, elapsed, pose):
-    from feedingrobot.controllers.full_spec import VARIANTS
+    from feedingrobot.validation.m2.spec import VARIANTS
     scene = FeedingScene('configs/m1_scene.json')
     state = place_arm(scene, scene.config['q_torque_poses'][pose])
     dt, iterations, tolerance = VARIANTS[variant]
@@ -61,8 +61,8 @@ def test_unknown_tool_contact_is_rejected(reverse):
 
 @pytest.fixture(scope='module')
 def identity_trace(tmp_path_factory):
-    from feedingrobot.controllers.full_spec import Case
-    from feedingrobot.controllers.full_runner import run_group
+    from feedingrobot.validation.m2.spec import Case
+    from feedingrobot.validation.m2.runner import run_group
     case = Case('stop', axis=1, sign=-1, event='expired', context='spring')
     out = tmp_path_factory.mktemp('identity')
     traces = run_group(case, 0, load_m2_config(), str(out))
@@ -71,7 +71,7 @@ def identity_trace(tmp_path_factory):
 
 @pytest.mark.parametrize('change', ['seed', 'variant', 'config', 'solver', 'initial', 'geom', 'execution'])
 def test_identity_tamper_rejected(identity_trace, change):
-    from feedingrobot.controllers.full_checks import score
+    from feedingrobot.validation.m2.checks import score
     case, traces, _ = identity_trace
     data, meta = traces[0]
     assert score(case, 0, 'A', data, meta)[0] == []
@@ -98,9 +98,10 @@ def test_identity_tamper_rejected(identity_trace, change):
 
 def test_independent_pair_and_receipts(identity_trace):
     import json
-    from feedingrobot.controllers.full_checks import score, compare
-    from feedingrobot.controllers.full_identity import check_receipt
-    from feedingrobot.controllers.full_acceptance import digest
+    from feedingrobot.validation.m2.package import compare
+    from feedingrobot.validation.m2.checks import score
+    from feedingrobot.validation.m2.provenance import check_receipt
+    from feedingrobot.validation.m2.package import digest
     case, traces, out = identity_trace
     ids = []
     values = []
@@ -124,7 +125,7 @@ def test_independent_pair_and_receipts(identity_trace):
 
 @pytest.mark.parametrize('change', ['missing', 'duplicate', 'unknown', 'failed', 'skipped', 'xfail', 'teardown', 'mixed', 'run'])
 def test_execution_tamper_rejected(change):
-    from feedingrobot.controllers.full_contracts import check_execution
+    from feedingrobot.validation.m2.provenance import check_execution
     nodes = ['test_a', 'test_b']
     execution = {'run_id': 'run', 'exitstatus': 0, 'collected': nodes.copy(),
                  'reports': [{'nodeid': n, 'when': w, 'outcome': 'passed'} for n in nodes for w in ('setup', 'call', 'teardown')]}
@@ -161,9 +162,9 @@ def test_model_contact_ids_and_names():
 def test_calibration_package_fail_closed(identity_trace, tmp_path, monkeypatch):
     import json
     import shutil
-    from feedingrobot.controllers import full_acceptance as a
-    from feedingrobot.controllers.full_contracts import CONFIG_PATHS
-    from feedingrobot.controllers.full_spec import SCHEMA
+    from feedingrobot.validation.m2 import package as a
+    from feedingrobot.validation.m2.provenance import CONFIG_PATHS
+    from feedingrobot.validation.m2.spec import SCHEMA
     from feedingrobot.sim.model import repo_root
     case, _, folder = identity_trace
     shutil.copytree(folder, tmp_path/'cases')
@@ -184,9 +185,17 @@ def test_calibration_package_fail_closed(identity_trace, tmp_path, monkeypatch):
     assert not a.evaluate(tmp_path, calibration=True)['scope_passed']
     core = a.evaluate(tmp_path, calibration=True, _require_negatives=False)
     assert core['scope_passed'] and not core['m3_ready'], core['reasons']
-    write('report.json', core)
-    write('run.json', {**header, 'incomplete': False})
+    assert a.finalize(tmp_path, calibration=True) == core
+    import mujoco
+    from feedingrobot.validation.m2 import negatives, runner
+    def forbid(*args, **kwargs):
+        raise AssertionError('verification must be read-only')
+    monkeypatch.setattr(mujoco, 'mj_step', forbid)
+    monkeypatch.setattr(negatives, 'run_negative', forbid)
+    monkeypatch.setattr(runner, 'run_group', forbid)
+    before_verify = {str(p.relative_to(tmp_path)): a.digest(p) for p in tmp_path.rglob('*') if p.is_file()}
     assert a.evaluate(tmp_path, calibration=True, check_workspace=True) == core
+    assert before_verify == {str(p.relative_to(tmp_path)): a.digest(p) for p in tmp_path.rglob('*') if p.is_file()}
     write('report.json', {**core, 'm3_ready': True})
     assert 'report_mismatch' in {r['code'] for r in a.evaluate(tmp_path, calibration=True)['reasons']}
     write('report.json', core)

@@ -87,6 +87,7 @@ class CartesianImpedance:
         self.reset_flags()
 
     def reset_flags(self) -> None:
+        self._input_aborted = False
         self.tau_prev = np.zeros(_ARM)
         self.power_on = True
         self.power_time = 0.0
@@ -149,6 +150,7 @@ class CartesianImpedance:
         return float(self.data.time - self.scene.time_offset)
 
     def _abort_input(self, reason: str, when: float) -> None:
+        self._input_aborted = True
         self._command = None
         if self.guard is None:
             return
@@ -322,7 +324,35 @@ class CartesianImpedance:
             beta = min(beta, allow / abs(vel))
         return float(np.clip(beta, 0.0, 1.0))
 
+    def _preflight(self, state: dict) -> bool:
+        """Reject the sampled state before forward dynamics can overwrite it."""
+        if self._input_aborted or (self.guard is not None and self.guard.status == "ABORTED"):
+            self._command = None
+            self._input_aborted = True
+            return False
+        fields = ("q", "dq", "tcp_pos", "tcp_mat", "raw_wrench_sensor")
+        invalid = not state.get("finite", True) or any(
+            not np.all(np.isfinite(state[key])) for key in fields
+        )
+        warnings = state.get("warnings") or []
+        if not invalid and not any(warnings):
+            return True
+        self._command = None
+        self._input_aborted = True
+        if self.guard is not None:
+            self.guard.latch({
+                "tick": int(state["tick"]),
+                "time": float(state.get("episode_time", self.now())),
+                "reason": "non-finite" if invalid else "warning",
+                "phase": self.phase, "pair": None, "geoms": None,
+                "measured": "pre-step-state" if invalid else warnings,
+                "limit": None,
+            })
+        return False
+
     def compute(self, state: dict, dt: float) -> tuple[np.ndarray, dict]:
+        if not self._preflight(state):
+            return np.zeros(_ARM), {"apply": False, "status": "ABORTED", "phase_k": self.phase, "gear": "STOP"}
         dt = float(dt)
         self.sim_time = float(state.get("episode_time", state.get("sim_time", self.sim_time)))
         self._tcp_pos = np.asarray(state["tcp_pos"], dtype=float)
@@ -643,9 +673,11 @@ class CartesianImpedance:
 
 def control_step(controller: CartesianImpedance, guard, phase: str | None = None, *, hold_driver: bool = False):
     """One control interval: compute from the current state, then step physics, then observe."""
+    if phase is not None and phase not in PHASES:
+        raise ValueError(f"unknown phase {phase}")
     state = controller.scene.snapshot()
-    if not np.all(np.isfinite(state["raw_wrench_sensor"])):
-        controller._abort_input("non-finite-wrench", controller.now())
+    if not controller._preflight(state):
+        return state, {"apply": False, "status": "ABORTED", "phase_k": controller.phase, "gear": "STOP"}
     if phase in {"STOP", "RECOVER"} and guard.status == "RUNNING":
         controller.phase = phase
         guard.request_stop(controller.scene.tick, controller.now(), phase)

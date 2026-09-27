@@ -12,10 +12,10 @@ import numpy as np
 from feedingrobot.controllers.cartesian_impedance import CartesianImpedance, control_step
 from feedingrobot.controllers.guard import Guard
 from feedingrobot.controllers.so3 import orientation_error, so3_exp
-from feedingrobot.controllers.full_spec import Case, VARIANTS
+from feedingrobot.validation.m2.spec import Case, VARIANTS, SCHEMA
 from feedingrobot.sim.scene import FeedingScene
 from feedingrobot.sim.model import load_config
-from feedingrobot.controllers.full_identity import identity, clean_config, solver_options
+from feedingrobot.validation.m2.provenance import identity, clean_config, solver_options
 
 
 def smooth(t, duration):
@@ -59,6 +59,7 @@ def prepare(case: Case, seed: int, controller_config: dict):
     preset = "food_on_spoon" if case.family == "carry" or case.context == "food" else "near_mouth" if case.family == "mouth" else "food_on_plate"
     state = scene.reset(seed=seed, preset=preset, settle_steps=0)
     reset_qpos = scene.data.qpos.copy()
+    food_placement_attempt = None
     if case.family not in {"carry", "plate", "mouth"} and case.context != "food":
         q = np.array(scene.config["q_torque_poses"][case.pose % 3], dtype=float)
         if case.pose >= 3:
@@ -70,8 +71,20 @@ def prepare(case: Case, seed: int, controller_config: dict):
     mujoco.mj_forward(scene.model, scene.data)
     if case.family == "plate":
         _ik_reset(scene, np.array([.49, -.22, .030]), so3_exp(np.array([0., .5, 0.])) @ state["tcp_mat"])
+        # The M1 reset checked food against the preset arm, before M2's IK move.
+        # Use the same eight proposals, now checked against the actual start pose.
+        placement_rng = np.random.default_rng(seed)
+        for attempt in range(8):
+            position = np.r_[np.array([.45, -.18]) + placement_rng.uniform(-.025, .025, 2), .03]
+            scene._set_food(position, [1., 0., 0., 0.])
+            mujoco.mj_forward(scene.model, scene.data)
+            if not scene._illegal():
+                food_placement_attempt = attempt
+                break
+        if food_placement_attempt is None:
+            raise RuntimeError(f"no legal food placement after M2 IK: {case.key}, seed={seed}")
     if case.event == "singularity":
-        from feedingrobot.controllers.v6checks import SINGULAR_Q, REST_DQ
+        from feedingrobot.validation.m2.spec import SINGULAR_Q, REST_DQ
         scene.data.qpos[scene.index.arm_qpos_adr] = SINGULAR_Q
         scene.data.qvel[scene.index.arm_dof_adr] = REST_DQ
         mujoco.mj_forward(scene.model,scene.data)
@@ -105,6 +118,7 @@ def prepare(case: Case, seed: int, controller_config: dict):
     if scene._illegal():
         raise RuntimeError(f"illegal initial state: {case.key}, seed={seed}")
     source = {'case': case.key, 'seed': seed, 'preset': preset,
+              'food_placement_attempt': food_placement_attempt,
               'reset_qpos': reset_qpos.tolist(), 'pre_settle_qpos': scene.data.qpos.tolist(),
               'pre_settle_qvel': scene.data.qvel.tolist()}
     ctl = CartesianImpedance(scene, cfg)
@@ -189,6 +203,8 @@ def run_variant(case, seed, variant, scene, cfg, initial):
     velocities = [tcp_twist(scene)]
     physical_dq = [scene.data.qvel[scene.index.arm_dof_adr].copy()]
     fixture_rows, timing = [], []
+    references_before, command_times, tool_acceleration, arm_acceleration = [], [], [], []
+    external_com_before, applied_wrenches = [], []
     import time
     snapshot_fn = scene.snapshot
     fault_tick = round(1.42 / scene.dt) + 1
@@ -242,12 +258,34 @@ def run_variant(case, seed, variant, scene, cfg, initial):
                 scene.data.ctrl[aid] = .04 * smooth(t-3., .5)
             supplied.append(np.zeros(6) if ctl._command is None else ctl._command["twist"].copy())
             external.append(np.r_[force, point])
+            reference_before = (ctl.reference.p_ref.copy(), ctl.reference.r_ref.copy())
+            force_body_com = scene.data.xipos[scene.index.tool_body_id].copy()
+            command_time = ([ctl._command['command_time'], ctl._command['valid_until']]
+                            if ctl._command is not None else [-1., -1.])
             started = time.perf_counter()
             state, info = control_step(ctl, guard, hold_driver=case.family == "mouth")
             timing.append(time.perf_counter()-started)
             if not info["apply"]:
                 supplied.pop(); external.pop(); timing.pop()
                 break
+            references_before.append(reference_before)
+            external_com_before.append(force_body_com)
+            applied_wrenches.append(scene.data.xfrc_applied[scene.index.tool_body_id].copy())
+            command_times.append(command_time)
+            accelerations = []
+            mujoco.mj_rnePostConstraint(scene.model, scene.data)
+            for body in ctl.wrench.body_ids:
+                acceleration = np.zeros(6)
+                mujoco.mj_objectAcceleration(scene.model, scene.data, mujoco.mjtObj.mjOBJ_BODY, body, acceleration, 0)
+                acceleration[3:] += scene.model.opt.gravity
+                accelerations.append(acceleration)
+            tool_acceleration.append(accelerations)
+            arm_acceleration.append(scene.data.qacc[scene.index.arm_dof_adr].copy())
+            for contact_id, contact in enumerate(state['contacts']):
+                wrench = np.zeros(6)
+                if contact_id < scene.data.ncon:
+                    mujoco.mj_contactForce(scene.model, scene.data, contact_id, wrench)
+                contact['wrench_contact'] = wrench
             states.append(state); infos.append(info); velocities.append(tcp_twist(scene))
             physical_dq.append(scene.data.qvel[scene.index.arm_dof_adr].copy())
             if case.fixture:
@@ -266,12 +304,21 @@ def run_variant(case, seed, variant, scene, cfg, initial):
     n = len(infos)
     arrays = {key: np.array([s[key] for s in states]) for key in ("q", "dq", "tcp_pos", "tcp_mat", "food_pos", "food_quat", "raw_wrench_sensor", "qfrc_actuator", "warnings", "finite")}
     arrays.update({key: np.array([i[key] for i in infos]) for key in (
-        "p_ref", "r_ref", "v_ref", "twist_command", "twist_limited", "tau_cmd", "tau_raw", "tau_bias", "tau_task", "tau_null", "tau_before", "k", "d", "phase_k", "rho", "execution", "status", "power_on", "blocked", "reference_correction_pos",
+        "p_ref", "r_ref", "v_ref", "twist_command", "twist_limited", "tau_cmd", "tau_raw", "tau_bias", "tau_task", "tau_null", "tau_before", "k", "d", "phase_k", "rho", "execution", "status", "power_on", "blocked", "reference_correction_pos", "reference_correction_rot", "candidate_twist", "beta", "v_hist", "qdot_pred", "scale", "reanchored",
         "ft_compensated_wrench_tcp", "ft_delivered_wrench_tcp", "ft_estimated_kinematics", "ft_estimated_valid", "ft_valid", "ft_sample_time", "ft_sample_tick", "ft_filtered_wrench_tcp", "ft_tool_load_predicted", "ft_tcp_wrench_world", "ft_bias_wrench_tcp", "ft_tool_velocity", "ft_tool_com", "ft_tool_inertia", "ft_tcp_position")})
     arrays["physical_dq"] = np.array(physical_dq)
+    arrays["tool_acceleration"] = np.array(tool_acceleration)
+    arrays["arm_acceleration"] = np.array(arm_acceleration)
+    arrays["external_body_com_before"] = np.array(external_com_before)
+    arrays["applied_wrench_com"] = np.array(applied_wrenches)
+    arrays["p_ref_before"] = np.array([row[0] for row in references_before])
+    arrays["r_ref_before"] = np.array([row[1] for row in references_before])
+    arrays["command_times"] = np.array(command_times)
+    arrays["correction_reason"] = np.array([i["correction_reason"] or "" for i in infos])
+    arrays["constraint_reset"] = np.array([i["constraint_reset"] or "" for i in infos])
     arrays["initial_tool_velocity"] = initial_measurement["tool_velocity"]
     arrays["initial_compensated"] = initial_measurement["compensated_wrench_tcp"]
-    arrays.update(t=np.arange(n+1)*scene.dt, tick=np.arange(n+1), tcp_twist=np.array(velocities), external=np.array(external), supplied=np.array(supplied), origin=origin, rotation=rotation, initial_qpos=initial["qpos"], initial_qvel=initial["qvel"], initial_tau=initial["tau"], fixture=np.array(fixture_rows).reshape(-1, 6), wall_seconds=np.array(timing))
+    arrays.update(t=np.array([s["episode_time"] for s in states]), tick=np.array([s["tick"] for s in states]), tcp_twist=np.array(velocities), external=np.array(external), supplied=np.array(supplied), origin=origin, rotation=rotation, initial_qpos=initial["qpos"], initial_qvel=initial["qvel"], initial_tau=initial["tau"], fixture=np.array(fixture_rows).reshape(-1, 6), wall_seconds=np.array(timing))
     arrays["age"] = np.array([np.nan if i["ft_age_s"] is None else i["ft_age_s"] for i in infos])
     offsets, contacts = [0], []
     for s in states[1:]:
@@ -280,8 +327,14 @@ def run_variant(case, seed, variant, scene, cfg, initial):
     for name in ("geom1", "geom2", "dist"):
         arrays["contact_"+name] = np.array([c[name] for c in contacts], dtype=str if name != "dist" else float)
     arrays["contact_force"] = np.array([c["force_on_geom2_world"] for c in contacts]).reshape(-1, 3)
-    for key, width in (("pos",3),("frame",9),("force_contact",3)):
+    for key, width in (("pos",3),("frame",9),("force_contact",3),("wrench_contact",6)):
         arrays["contact_"+key] = np.array([c[key] for c in contacts]).reshape(-1,width)
+    frame = arrays['contact_frame'].reshape(-1, 3, 3)
+    local = arrays['contact_wrench_contact']
+    arrays['contact_wrench_world'] = np.concatenate([
+        np.einsum('nji,nj->ni', frame, local[:, :3]),
+        np.einsum('nji,nj->ni', frame, local[:, 3:]),
+    ], axis=1)
     for key in ("geom1_id","geom2_id"):
         arrays["contact_"+key] = np.array([c[key] for c in contacts],dtype=int)
     abort_probe = None
@@ -289,7 +342,7 @@ def run_variant(case, seed, variant, scene, cfg, initial):
         tick, now = scene.tick, scene.data.time
         applied = [control_step(ctl,guard)[1]["apply"] for _ in range(3)]
         abort_probe = {"tick_before":tick,"tick_after":scene.tick,"time_before":now,"time_after":scene.data.time,"apply":applied}
-    metadata = {**case.manifest(seed, variant), "fault": guard.failure, "events": guard.events,
+    metadata = {**case.manifest(seed, variant), "schema_version": SCHEMA, "fault": guard.failure, "events": guard.events,
                 "stopped_ok": guard.stopped_ok, "actual_duration": n*scene.dt, "abort_probe":abort_probe,
                 "effective_controller": cfg, "joint_ranges": ctl.ranges.tolist(),
                 "normal": scene.fixture_normal.tolist() if case.fixture else None,
@@ -322,7 +375,7 @@ def run_group(case: Case, seed: int, config: dict, output: str | None = None):
             temporary = Path(str(path) + ".json.partial")
             temporary.write_text(json.dumps(metadata, indent=2))
             temporary.replace(str(path) + ".json")
-            from feedingrobot.controllers.full_acceptance import digest
+            from feedingrobot.validation.m2.provenance import digest
             receipt = {'case': case.manifest(seed, variant), 'execution': metadata['execution'],
                        'initial_source_identity': str(arrays['initial_source_identity'].item()),
                        'config_identity': str(arrays['config_identity'].item()),

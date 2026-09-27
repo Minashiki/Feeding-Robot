@@ -3,8 +3,8 @@ import argparse
 import json
 from pathlib import Path
 
-from feedingrobot.controllers.full_spec import cases
-from feedingrobot.controllers.full_acceptance import inputs,digest
+from feedingrobot.validation.m2.spec import cases
+from feedingrobot.validation.m2.package import inputs,digest
 from feedingrobot.scripts.m2_full_matrix import group_job,write
 from feedingrobot.scripts.m2_limited import current_limits,verify_limits
 from feedingrobot.sim.model import load_config

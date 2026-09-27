@@ -1852,7 +1852,7 @@ def check_second_stage(execution, reasons):
             _add(reasons, "nodeid", field=node)
 
 
-def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
+def verify_finished_report(run, scope: str, check_workspace: bool, *, rerun_adversarial=True) -> dict:
     from feedingrobot.controllers.acceptance import REMAINING_FULL_M2, SCHEMA_VERSION, SCOPE_NAME
 
     if scope in {"fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4", "fixes-v5"}:
@@ -1912,12 +1912,17 @@ def verify_finished_report(run, scope: str, check_workspace: bool) -> dict:
             check_second_stage(execution, reasons)
     adv_path = run / "adversarial_results.json"
     if scope == "fixes-v6" and not reasons:
-        fresh = run_adversarial(run)
+        fresh = run_adversarial(run) if rerun_adversarial else None
         if not adv_path.is_file():
             _add(reasons, "missing_file", field="adversarial_results.json")
         else:
             stored = _load(adv_path)
-            if not _same(stored, fresh):
+            if fresh is None:
+                fresh = stored
+            if not isinstance(stored, list) or any(not isinstance(row, dict) for row in stored) or [row.get('name') for row in stored] != sorted(ADVERSARIAL):
+                _add(reasons, "summary_mismatch", field="adversarial_results.json")
+                fresh = []
+            elif not _same(stored, fresh):
                 _add(reasons, "summary_mismatch", field="adversarial_results.json")
             for row in fresh:
                 if row["fixes_passed"] or not row["codes"] or "clean_copy" in row["codes"] or not ADVERSARIAL_EXPECTED.get(row["name"], set()).issubset(row["codes"]):

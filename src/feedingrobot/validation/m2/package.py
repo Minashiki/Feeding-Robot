@@ -1,35 +1,15 @@
 """Full-matrix package verification, isolated from historical fixes schemas."""
 from dataclasses import replace
-import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
 
-from feedingrobot.controllers.full_spec import SCHEMA, cases, manifest, VARIANTS, FORMAL_SEEDS, CALIBRATION_SEEDS
-from feedingrobot.controllers.full_checks import score, compare
-from feedingrobot.controllers.acceptance import collect_inputs
-from feedingrobot.sim.model import repo_root
-from feedingrobot.controllers.full_contracts import check_config_snapshots, check_execution, required_nodes
-from feedingrobot.controllers.full_identity import check_receipt, identity
-
-
-def digest(path):
-    h=hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for block in iter(lambda:f.read(1<<20),b''):h.update(block)
-    return h.hexdigest()
-
-
-def inputs():
-    rows=collect_inputs()['files']
-    root=repo_root()
-    extras=['assets/tests/m2_full_surface.xml','assets/tests/m2_full_wall.xml','M2Plan.md','SimModelPlan.md','docs/m2_interface.md']
-    return sorted(rows+[{'path':p,'sha256':digest(root/p)} for p in extras],key=lambda r:r['path'])
-
-
-def read(path):
-    return json.loads(Path(path).read_text(),parse_constant=lambda x: (_ for _ in ()).throw(ValueError('nonfinite JSON')))
+from feedingrobot.validation.m2.spec import SCHEMA, cases, manifest, VARIANTS, FORMAL_SEEDS, CALIBRATION_SEEDS
+from feedingrobot.validation.m2.checks import score
+from feedingrobot.validation.m2.provenance import digest, inputs, read
+from feedingrobot.validation.m2.provenance import check_config_snapshots, check_execution, required_nodes
+from feedingrobot.validation.m2.provenance import check_receipt, identity
 
 
 def package_identity(run):
@@ -41,7 +21,7 @@ def package_identity(run):
     return identity(files)
 
 
-def evaluate(run, *, check_workspace=False, calibration=False, _require_negatives=True, _case_cache=None):
+def evaluate(run, *, check_workspace=False, calibration=False, _require_negatives=True, _case_cache=None, _finalizing=False):
     run=Path(run)
     reasons=[]; metrics={}; comparisons=[]
     seeds=CALIBRATION_SEEDS if calibration else FORMAL_SEEDS
@@ -49,10 +29,13 @@ def evaluate(run, *, check_workspace=False, calibration=False, _require_negative
     def fail(code,**kwargs):reasons.append({'code':code,**kwargs})
     try:
         header=read(run/'run.json')
-        if header.get('schema_version')!=SCHEMA or header.get('stage')!=('calibration' if calibration else 'full') or (_require_negatives and header.get('incomplete') is not False):fail('run_identity')
+        if header.get('schema_version')!=SCHEMA or header.get('stage')!=('calibration' if calibration else 'full') or (_require_negatives and not _finalizing and header.get('incomplete') is not False):fail('run_identity')
         before=read(run/'input_hash_before.json');after=read(run/'input_hash_after.json')
         if before!=after:fail('inputs_changed')
-        if check_workspace and after!=inputs():fail('workspace_changed')
+        paths = [row['path'] for row in after]
+        if len(paths) != len(set(paths)) or set(paths) != {row['path'] for row in inputs()}:
+            fail('input_coverage')
+        if (check_workspace or not calibration) and after!=inputs():fail('workspace_changed')
         if read(run/'case_manifest.json')!=expected:fail('case_manifest')
         listed=read(run/'evidence_manifest.json')
         wanted={row['case_id']+suffix for row in expected for suffix in ('.npz','.json','.execution.json')}
@@ -70,7 +53,7 @@ def evaluate(run, *, check_workspace=False, calibration=False, _require_negative
             verdict=evaluate(cal,calibration=True,_case_cache=_case_cache)
             if not verdict['scope_passed'] or read(cal/'input_hash_after.json')!=after or read(cal/'m2_controller.json')!=cfg:fail('calibration_failed')
             legacy=read(run/'legacy_binding.json')
-            from feedingrobot.controllers.acceptance import verify_finished_report
+            from feedingrobot.validation.m2.legacy import verify_finished_report
             path=Path(legacy['path'])
             if digest(path/'report.json')!=legacy['sha256'] or not verify_finished_report(path,'fixes-v6',check_workspace).get('scope_passed'):fail('legacy_regression_failed')
             legacy_inputs={r['path']:r['sha256'] for r in read(path/'input_hash_after.json')['files']}
@@ -87,18 +70,18 @@ def evaluate(run, *, check_workspace=False, calibration=False, _require_negative
     for row in expected:
         name=row['case_id'];case=by_key[name.rsplit('-s',1)[0]]
         try:
-            with np.load(run/'cases'/f'{name}.npz',allow_pickle=False) as z:data=dict(z)
             meta=read(run/'cases'/f'{name}.json')
-            receipt=read(run/'cases'/f'{name}.execution.json')
-            reasons.extend({'case_id': name, **r} for r in check_receipt(case, row['seed'], row['variant'], data, meta, receipt, listed[name+'.npz'], listed[name+'.json']))
             eid=meta['execution']['id']
             if eid in executions:fail('duplicate_execution',case_id=name)
             executions.add(eid)
-            key=(scoring_identity,name,listed[name+'.npz'],listed[name+'.json'])
+            key=(scoring_identity,name,listed[name+'.npz'],listed[name+'.json'],listed[name+'.execution.json'])
             if _case_cache is not None and key in _case_cache:
                 errors,values=_case_cache[key]
             else:
+                with np.load(run/'cases'/f'{name}.npz',allow_pickle=False) as z:data=dict(z)
+                receipt=read(run/'cases'/f'{name}.execution.json')
                 errors,values=score(case,row['seed'],row['variant'],data,meta,cfg['stop']['damping_nm_s_per_rad'],cfg)
+                errors=check_receipt(case,row['seed'],row['variant'],data,meta,receipt,listed[name+'.npz'],listed[name+'.json'])+errors
                 if _case_cache is not None:
                     _case_cache[key]=(errors,values)
             reasons.extend({'case_id':name,**r} for r in errors)
@@ -125,12 +108,12 @@ def evaluate(run, *, check_workspace=False, calibration=False, _require_negative
                         for key,floor in (('tracking_position_rms',.0002),('tracking_rotation_rms',np.deg2rad(.1))):
                             if current[key]>1.25*base[key]+floor:fail('noise_tracking',case_id=case.key,metric=key)
     if not calibration and _require_negatives:
-        from feedingrobot.controllers.full_negatives import check_negatives
+        from feedingrobot.validation.m2.negatives import check_negatives
         reasons.extend(check_negatives(run))
     verdict=result(reasons,metrics,comparisons,calibration)
     if not _require_negatives:
         verdict['m3_ready']=False
-    else:
+    elif not _finalizing:
         try:
             saved=read(run/'report.json')
             if saved != verdict or header.get('m3_ready') != verdict['m3_ready']:
@@ -146,3 +129,50 @@ def result(reasons,metrics,comparisons,calibration):
             'm3_ready':passed and not calibration,'hybrid_force_status':'disabled','reasons':reasons,
             'remaining_m2_requirements':[] if passed and not calibration else sorted({r['code'] for r in reasons}) or ['formal_matrix'],
             'metrics':metrics,'comparisons':comparisons}
+
+
+def finalize(run, *, calibration=False):
+    """Validate all evidence, then publish the completion record last."""
+    run = Path(run)
+    cache = {}
+    verdict = evaluate(run, check_workspace=True, calibration=calibration,
+                       _case_cache=cache, _finalizing=True)
+    if not verdict['scope_passed']:
+        return verdict
+    header = read(run/'run.json')
+    for filename, payload in (
+        ('report.json', verdict),
+        ('run.json', {**header, 'incomplete': False, 'm3_ready': verdict['m3_ready']}),
+    ):
+        temporary = run/(filename + '.tmp')
+        temporary.write_text(json.dumps(payload, indent=2, allow_nan=False))
+        temporary.replace(run/filename)
+    verified = evaluate(run, check_workspace=True, calibration=calibration, _case_cache=cache)
+    if not verified['scope_passed']:
+        temporary = run/'run.json.tmp'
+        temporary.write_text(json.dumps({**header, 'incomplete': True, 'm3_ready': False}, indent=2))
+        temporary.replace(run/'run.json')
+    return verified
+
+
+def compare(left, right):
+    failures = []
+    if left.get('execution_id') == right.get('execution_id'):
+        failures.append({'code': 'duplicate_execution'})
+    if left.get('initial_source_identity') != right.get('initial_source_identity'):
+        failures.append({'code': 'initial_pair:source'})
+    if left.get('variant') != 'A' or right.get('variant') not in {'B', 'C'}:
+        failures.append({'code': 'variant_pair'})
+    for key, floor in (("position_rms",.0001),("rotation_rms",np.deg2rad(.05)),("tracking_position_rms",.0001),("tracking_rotation_rms",np.deg2rad(.05)),("force_peak",.02),("force_mean",.02),("moment_peak",.002),("tau_peak",.05),("impulse",1e-4),("contact_force_peak",.02),("contact_moment_peak",.002),("contact_impulse",1e-4)):
+        a,b = np.asarray(left[key]),np.asarray(right[key])
+        if np.any(np.abs(a-b)>np.maximum(.1*np.maximum(np.abs(a),np.abs(b)),floor)+1e-12):
+            failures.append({"code":"convergence:"+key,"left":a.tolist(),"right":b.tolist()})
+    for key in ("initial_qpos","initial_qvel"):
+        if not np.array_equal(left[key],right[key]): failures.append({"code":"initial_pair:"+key})
+    if set(left["events"]) != set(right["events"]):
+        failures.append({"code":"event_pair"})
+    else:
+        for event in left["events"]:
+            if abs(left["events"][event]-right["events"][event]) > .020+1e-12:
+                failures.append({"code":"event_time:"+event})
+    return failures

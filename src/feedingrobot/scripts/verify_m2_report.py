@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from feedingrobot.controllers.acceptance import verify_finished_report
+from feedingrobot.validation.m2.legacy import verify_finished_report
 from feedingrobot.sim.model import repo_root
 
 
@@ -15,10 +15,10 @@ def assess_m2(run: Path, scope: str, check_workspace: bool) -> dict:
         header = json.loads((run / "run.json").read_text())
     except (OSError, ValueError):
         header = {}
-    if header.get("schema_version") in {"m2-full-v1", "m2-full-v2"}:
-        from feedingrobot.controllers.full_acceptance import evaluate
+    if header.get("schema_version") in {"m2-full-v1", "m2-full-v2", "m2-full-v3"}:
+        from feedingrobot.validation.m2.package import evaluate
         verdict = evaluate(run, check_workspace=check_workspace, calibration=header.get("stage") == "calibration")
-        if scope != "full" or header.get("stage") != "full":
+        if scope != ("calibration" if header.get("stage") == "calibration" else "full"):
             verdict["scope_passed"] = verdict["m3_ready"] = False
             verdict["reasons"].append({"code":"full_scope_required"})
         return verdict
@@ -28,7 +28,7 @@ def assess_m2(run: Path, scope: str, check_workspace: bool) -> dict:
 def main():
     parser = argparse.ArgumentParser(description="Check an M2 run directory without resimulating.")
     parser.add_argument("--run", required=True)
-    parser.add_argument("--scope", default="full", choices=("fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4", "fixes-v5", "fixes-v6", "full"))
+    parser.add_argument("--scope", default="full", choices=("fixes-v1", "fixes-v2", "fixes-v3", "fixes-v4", "fixes-v5", "fixes-v6", "calibration", "full"))
     parser.add_argument("--check-current-workspace", action="store_true")
     args = parser.parse_args()
     run = Path(args.run)
@@ -54,6 +54,8 @@ def main():
             indent=2,
         )
     )
+    if args.scope == "calibration" and verdict.get("scope_passed") and verdict["m3_ready"] is False:
+        return
     if args.scope == "fixes-v6" and verdict.get("scope_passed") and verdict["m3_ready"] is False:
         return
     if args.scope == "full" and verdict.get("scope_passed") and verdict["m3_ready"] is True:

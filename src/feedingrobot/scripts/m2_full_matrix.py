@@ -6,12 +6,12 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 import subprocess
 import sys
 
-from feedingrobot.controllers.full_spec import SCHEMA, cases, manifest, VARIANTS, FORMAL_SEEDS, CALIBRATION_SEEDS
-from feedingrobot.controllers.full_runner import run_group
-from feedingrobot.controllers.full_checks import score, compare
-from feedingrobot.controllers.full_acceptance import inputs, digest, evaluate, package_identity, result
-from feedingrobot.controllers.full_contracts import CONFIG_PATHS, required_nodes
-from feedingrobot.controllers.full_negatives import negative_nodes, check_negatives
+from feedingrobot.validation.m2.spec import SCHEMA, cases, manifest, VARIANTS, FORMAL_SEEDS, CALIBRATION_SEEDS
+from feedingrobot.validation.m2.runner import run_group
+from feedingrobot.validation.m2.checks import score
+from feedingrobot.validation.m2.package import inputs, digest, evaluate, package_identity, result, finalize, compare
+from feedingrobot.validation.m2.provenance import CONFIG_PATHS, required_nodes
+from feedingrobot.validation.m2.negatives import negative_nodes, check_negatives
 from feedingrobot.sim.model import repo_root
 
 
@@ -123,13 +123,6 @@ def run(args):
         if proc.returncode or errors or inputs()!=before:
             write(out/'report.json',result(errors or [{'code':'negative_execution'}],verdict['metrics'],verdict['comparisons'],False))
             return 1
-        verdict['m3_ready']=True
-        verdict['remaining_m2_requirements']=[]
-    write(out/'report.json',verdict)
-    write(out/'run.json',{**header,'incomplete':False,'m3_ready':verdict['m3_ready']})
-    verdict=evaluate(out,check_workspace=True,calibration=calibration)
-    if not verdict['scope_passed']:
-        write(out/'run.json',header)
-        write(out/'report.json',verdict)
+    verdict=finalize(out,calibration=calibration)
     print(json.dumps({key:value for key,value in verdict.items() if key not in {'metrics','comparisons'}},indent=2))
     return 0 if verdict['scope_passed'] else 1
