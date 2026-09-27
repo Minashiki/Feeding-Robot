@@ -258,6 +258,7 @@ class CartesianImpedance:
             self.transition_elapsed = self.blend_s
             return
         if target != self.target_gear:
+            self.reference.reset_progress()
             self.k_start = self._k.copy()
             self.d_start = self._d.copy()
             self.limits_start = self.effective_limits()
@@ -566,6 +567,8 @@ class CartesianImpedance:
             "scale": shaped["scale"],
             "blocked": shaped["blocked"],
             "blocked_now": bool(shaped.get("blocked_now", False)),
+            "block_progress": shaped["block_progress"],
+            "block_correction_pos": shaped["block_correction_pos"],
             "reanchored": shaped["reanchored"],
             "tau_task": jacobian.T @ wrench_c,
             "tau_bias": bias.copy(),

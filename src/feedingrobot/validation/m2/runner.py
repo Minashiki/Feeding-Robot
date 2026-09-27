@@ -307,6 +307,9 @@ def run_variant(case, seed, variant, scene, cfg, initial):
         "p_ref", "r_ref", "v_ref", "twist_command", "twist_limited", "tau_cmd", "tau_raw", "tau_bias", "tau_task", "tau_null", "tau_before", "k", "d", "phase_k", "rho", "execution", "status", "power_on", "blocked", "reference_correction_pos", "reference_correction_rot", "candidate_twist", "beta", "v_hist", "qdot_pred", "scale", "reanchored",
         "ft_compensated_wrench_tcp", "ft_delivered_wrench_tcp", "ft_estimated_kinematics", "ft_estimated_valid", "ft_valid", "ft_sample_time", "ft_sample_tick", "ft_filtered_wrench_tcp", "ft_tool_load_predicted", "ft_tcp_wrench_world", "ft_bias_wrench_tcp", "ft_tool_velocity", "ft_tool_com", "ft_tool_inertia", "ft_tcp_position")})
     arrays["physical_dq"] = np.array(physical_dq)
+    arrays["blocked_now"] = np.array([i["blocked_now"] for i in infos])
+    arrays["block_progress"] = np.array([i["block_progress"] for i in infos])
+    arrays["block_correction_pos"] = np.array([i["block_correction_pos"] for i in infos])
     arrays["tool_acceleration"] = np.array(tool_acceleration)
     arrays["arm_acceleration"] = np.array(arm_acceleration)
     arrays["external_body_com_before"] = np.array(external_com_before)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
 from feedingrobot.controllers.so3 import integrate_rotation, orientation_error, so3_log
@@ -28,6 +30,8 @@ class ReferenceShaper:
         self.block_force = float(blocked["force_n"])
         self.block_error = float(blocked["error_m"])
         self.block_confirm = float(blocked["confirm_s"])
+        self.progress_window = float(blocked["progress_window_s"])
+        self.progress_ratio = float(blocked["progress_ratio"])
         self.sat_confirm = float(blocked["sat_s"])
         self.dev_confirm = float(blocked["dev_s"])
         self.box = float(config["workspace_box_m"])
@@ -41,6 +45,7 @@ class ReferenceShaper:
         self.anchor = None
         self.q0 = None
         self._block_time = 0.0
+        self._block_deficit = 0.0
         self._sat_time = 0.0
         self._dev_time = 0.0
         self.blocked = False
@@ -50,9 +55,40 @@ class ReferenceShaper:
         self.reference_correction_pos = np.zeros(3)
         self.reference_correction_rot = 0.0
         self.correction_reason = None
+        self.block_correction_pos = np.zeros(3)
         self._sat_time = 0.0
+        self.reset_progress()
+
+    def reset_progress(self) -> None:
+        self._positions = deque()
+        self._progress_time = 0.0
+        self._progress_direction = None
+        self._progress_velocity = np.zeros(3)
+        self._progress_span = 0.0
+        self._block_time = 0.0
+        self._block_deficit = 0.0
+
+    def _measure_progress(self, pos, twist, dt, enabled):
+        speed = float(np.linalg.norm(twist[:3]))
+        if not enabled or speed <= 1e-6:
+            self.reset_progress()
+            return
+        direction = twist[:3] / speed
+        if self._progress_direction is not None and direction @ self._progress_direction <= 1e-12:
+            self.reset_progress()
+        self._progress_direction = direction.copy()
+        self._progress_time += dt
+        self._positions.append((self._progress_time, np.asarray(pos, dtype=float).copy()))
+        start = self._progress_time - self.progress_window
+        while len(self._positions) > 1 and self._positions[1][0] <= start + 1e-12:
+            self._positions.popleft()
+        time, previous = self._positions[0]
+        self._progress_span = self._progress_time - time
+        self._progress_velocity = ((np.asarray(pos) - previous) / self._progress_span
+                                   if self._progress_span > 1e-12 else np.zeros(3))
 
     def anchor_pose(self, pos: np.ndarray, rot: np.ndarray, q: np.ndarray) -> None:
+        self.reset_progress()
         self.p_ref = np.asarray(pos, dtype=float).copy()
         self.r_ref = np.asarray(rot, dtype=float).reshape(3, 3).copy()
         self.anchor = self.p_ref.copy()
@@ -68,6 +104,7 @@ class ReferenceShaper:
         self.constraint_reset = None
 
     def reanchor(self, pos: np.ndarray, rot: np.ndarray) -> None:
+        self.reset_progress()
         jump = np.asarray(pos, dtype=float) - self.p_ref
         self.clipped_offset = jump.copy()
         self.p_ref = np.asarray(pos, dtype=float).copy()
@@ -128,8 +165,11 @@ class ReferenceShaper:
         self.reference_correction_pos = np.zeros(3)
         self.reference_correction_rot = 0.0
         self.correction_reason = None
+        self.block_correction_pos = np.zeros(3)
         beta = 1.0
         twist = np.asarray(twist, dtype=float).reshape(6)
+        self._measure_progress(pos, twist, dt, active and execution in {"run", "zero"}
+                               and not saturated and float(scale) > 0.0)
         lin = np.zeros(3)
         ang = np.zeros(3)
         candidate = np.zeros(6)
@@ -156,7 +196,7 @@ class ReferenceShaper:
             ang = _accel_limit(self.v_ang, ang, limits["alpha"], dt)
             lin = _limit_norm(lin, envelope["v"])
             ang = _limit_norm(ang, envelope["w"])
-            lin, ang, blocked_now = self._suppress(lin, ang, pos, rot, force, dt, limits, saturated, active)
+            lin, ang, blocked_now = self._suppress(lin, ang, pos, rot, force, dt, limits, saturated, active, twist[:3])
             if self.anchor is not None and self.box > 0:
                 trial = self.p_ref + lin * dt
                 excess = np.abs(trial - self.anchor) - self.box
@@ -181,6 +221,7 @@ class ReferenceShaper:
             self.r_ref = integrate_rotation(prev_r, ang, dt)
         self._clip_deviation(pos, rot, limits, dt)
         if float(np.linalg.norm(self.reference_correction_pos)) > 1e-15 or self.reference_correction_rot > 1e-15:
+            self.reset_progress()
             self.correction_reason = "saturation_deviation"
             self.reanchored = True
         if self.reanchored or not integrate:
@@ -208,31 +249,48 @@ class ReferenceShaper:
             "correction_reason": self.correction_reason,
             "beta": float(beta),
             "candidate": np.asarray(candidate, dtype=float).copy(),
+            "block_progress": np.r_[self._progress_velocity, self._progress_span, self._block_time, self._block_deficit],
+            "block_correction_pos": self.block_correction_pos.copy(),
         }
 
-    def _suppress(self, lin, ang, pos, rot, force, dt, limits, saturated, active):
+    def _suppress(self, lin, ang, pos, rot, force, dt, limits, saturated, active, command):
         err = self.p_ref - np.asarray(pos, dtype=float)
-        n = float(np.linalg.norm(lin))
+        n = float(np.linalg.norm(command))
         blocked_now = False
         if active and n > 1e-6:
-            direction = lin / n
+            direction = command / n
             oppose = -float(np.dot(np.asarray(force, dtype=float).reshape(3), direction))
             lag = float(np.dot(err, direction))
-            if oppose > self.block_force and lag > self.block_error:
+            normal = -np.asarray(force, dtype=float) / max(float(np.linalg.norm(force)), 1e-30)
+            requested = float(command @ normal)
+            progress = float(self._progress_velocity @ normal)
+            stalled = (self._progress_span >= self.progress_window - 1e-12
+                       and requested > 1e-6
+                       and progress <= self.progress_ratio * requested)
+            if oppose > self.block_force and lag > self.block_error and stalled:
                 self._block_time += dt
+                self._block_deficit += (requested - progress) * dt
             else:
-                self._block_time = 0.0
-            if self._block_time >= self.block_confirm - 1e-15:
-                lin = lin - direction * float(np.dot(lin, direction))
+                self._block_time = self._block_deficit = 0.0
+            deficit_confirmed = (self._block_time >= self.config["blocked"]["deficit_confirm_s"] - 1e-15
+                                 and self._block_deficit >= self.config["blocked"]["deficit_m"] - 1e-15)
+            if self._block_time >= self.block_confirm - 1e-15 or deficit_confirmed:
+                lin = lin - normal * max(float(lin @ normal), 0.0)
+                self.block_correction_pos = -normal * max(float(err @ normal) - self.block_error, 0.0)
+                self.p_ref += self.block_correction_pos
+                if np.linalg.norm(self.block_correction_pos) > 1e-15:
+                    self.reanchored = True
+                    self.correction_reason = "blocked_progress"
+                    self.reset_progress()
                 blocked_now = True
                 self.blocked = True
         else:
-            self._block_time = 0.0
+            self._block_time = self._block_deficit = 0.0
         if saturated:
             self._sat_time += dt
         else:
             self._sat_time = 0.0
-        dev = float(np.linalg.norm(err))
+        dev = float(np.linalg.norm(self.p_ref - np.asarray(pos, dtype=float)))
         ori = float(np.linalg.norm(orientation_error(self.r_ref, rot)))
         at_cap = dev >= limits["pos_dev"] - 1e-6 or ori >= limits["rot_dev"] - 1e-5
         if at_cap:

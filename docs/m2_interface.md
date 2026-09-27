@@ -37,4 +37,6 @@ reset 后力矩从给定的 `tau_applied`（场景复位后为 0）按变化率�
 
 `info` 中的 `ft_*` 字段是步后样本上的补偿结果，其 sample_tick/sample_time 对应 next_state。控制计算只使用上一份已可用缓存。保护使用未延迟的 `compensated_wrench_tcp`。`delivered_wrench_tcp` 是低通并延迟后的观测，不能当作即时保护。
 
-步进前的 `finite=false`、已有 MuJoCo warning 或控制所需状态/原始 wrench 非有限值，在任何 `mj_forward` 前拒绝：锁存 ABORTED、取消命令、`apply=false`，当前及后续调用不推进 tick/time。`compute` 与 `control_step` 使用同一预检。未知 phase 在修改状态前抛出 `ValueError`；None 保持原义。完整验收与 full-v3 证据格式见 `docs/m2_acceptance.md`。
+步进前的 `finite=false`、已有 MuJoCo warning 或控制所需状态/原始 wrench 非有限值，在任何 `mj_forward` 前拒绝：锁存 ABORTED、取消命令、`apply=false`，当前及后续调用不推进 tick/time。`compute` 与 `control_step` 使用同一预检。未知 phase 在修改状态前抛出 `ValueError`；None 保持原义。完整验收与 full-v5 证据格式见 `docs/m2_acceptance.md`。
+
+受阻进展与回算参数见 M2Plan 第5.4节：有效命令的方向/幅值用于判定意图，整形候选用于实际裁切。`blocked_now` 与历史 `blocked` 分开；`block_progress` 和 `block_correction_pos` 提供独立重建所需证据。停止、reset和档位切换清除新增进展历史。

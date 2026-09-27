@@ -103,10 +103,18 @@ def check_analytic_motion(case, data):
         error = np.linalg.norm(data['p_ref'] - target, axis=1)[moving]
         if np.sqrt(np.mean(error**2)) > .002 or np.max(error) > .005:
             failures.append({'code': 'reference:circle_target', 'observed': float(np.max(error))})
-        if case.family == 'circle':
-            error = np.linalg.norm(data['tcp_pos'][1:] - target, axis=1)[moving]
-            if np.sqrt(np.mean(error**2)) > .002 or np.max(error) > .005:
-                failures.append({'code': 'motion:circle_target', 'observed': float(np.max(error))})
+        actual_target = target.copy()
+        if case.family == 'loaded_circle':
+            actual_target[t > 1., case.axis] += case.sign * case.load / GEAR_K['FREE'][case.axis]
+        error = np.linalg.norm(data['tcp_pos'][1:] - actual_target, axis=1)[moving]
+        if np.sqrt(np.mean(error**2)) > .002 or np.max(error) > .005:
+            failures.append({'code': 'motion:' + case.family + '_target', 'observed': float(np.max(error))})
+        if case.family == 'loaded_circle':
+            from feedingrobot.controllers.so3 import so3_log
+            error = np.array([np.linalg.norm(so3_log(r @ data['rotation'].T))
+                              for r in data['tcp_mat'][1:][moving]])
+            if np.sqrt(np.mean(error**2)) > np.deg2rad(1) or np.max(error) > np.deg2rad(3):
+                failures.append({'code': 'motion:loaded_circle_rotation', 'observed': float(np.max(error))})
     else:
         from feedingrobot.controllers.so3 import so3_log
         target = np.pi / 60 * np.sin(angle)
@@ -141,6 +149,11 @@ def check_reference_path(data, config, dt):
     previous_target = 'FREE'
     stopped = False
     origin = data['origin']
+    block_deficit = 0.
+    progress_start = None
+    progress_direction = None
+    block_spec = config['blocked']
+    window_steps = int(np.ceil(block_spec['progress_window_s'] / dt - 1e-12))
     for k in range(len(data['tau_cmd'])):
         p = data['p_ref'][k - 1].copy() if k else origin.copy()
         r = data['r_ref'][k - 1].copy() if k else data['rotation'].copy()
@@ -155,11 +168,15 @@ def check_reference_path(data, config, dt):
         if stop:
             limits = dict(config['gears']['STOP'])
         changed = target != previous_target
+        if changed:
+            progress_start = progress_direction = None
+            block_time = block_deficit = 0.
         new = config['gears'][target]
         gain_anchor = changed and (np.linalg.norm(p - actual_p) > new['pos_dev_m'] or np.linalg.norm(so3_log(r @ actual_r.T)) > new['rot_dev_rad'])
         if (stop and not stopped) or (not stop and gain_anchor):
             p, r, velocity = actual_p.copy(), actual_r.copy(), np.zeros(6)
-            block_time = dev_time = 0.
+            block_time = block_deficit = dev_time = 0.
+            progress_start = progress_direction = None
         stopped |= stop
         previous_target = target
         scale = float(np.clip((data['rho'][k] - .01) / .04, 0., 1.))
@@ -174,28 +191,63 @@ def check_reference_path(data, config, dt):
         equal('twist_command', k, twist)
         saturated = k > 0 and np.any(np.abs(data['tau_cmd'][k - 1] - data['tau_raw'][k - 1]) > 1e-8)
         integrate = not (power or stop or scale <= 0 or saturated)
+        command_norm = np.linalg.norm(twist[:3])
+        average = np.zeros(3)
+        span = 0.
+        if not integrate or command_norm <= 1e-6:
+            progress_start = progress_direction = None
+            block_time = block_deficit = 0.
+        else:
+            direction = twist[:3] / command_norm
+            if progress_start is None or (progress_direction is not None and direction @ progress_direction <= 1e-12):
+                progress_start = k
+                block_time = block_deficit = 0.
+            progress_direction = direction
+            start = max(progress_start, k - window_steps)
+            span = (k - start) * dt
+            if span > 1e-12:
+                average = (actual_p - data['tcp_pos'][start]) / span
         candidate = np.zeros(6)
         reanchor = False
+        blocked_now = False
+        block_correction = np.zeros(3)
         if integrate:
             for sl, speed, acceleration in [(slice(0, 3), 'v', 'a'), (slice(3, 6), 'w', 'alpha')]:
                 history = bound(velocity[sl], limits[speed] * scale)
                 requested = bound(twist[sl], limits[speed] * scale)
                 candidate[sl] = bound(history + bound(requested - history, limits[acceleration] * dt), limits[speed] * scale)
-            norm = np.linalg.norm(candidate[:3])
+            norm = np.linalg.norm(twist[:3])
             force = data['ft_compensated_wrench_tcp'][k - 1, :3] if k else data['initial_compensated'][:3]
-            direction = candidate[:3] / max(norm, 1e-30)
-            opposing = norm > 1e-6 and -force @ direction > .3 and (p - actual_p) @ direction > .002
+            direction = twist[:3] / max(norm, 1e-30)
+            normal = -force / max(np.linalg.norm(force), 1e-30)
+            requested = float(twist[:3] @ normal)
+            stalled = (span >= block_spec['progress_window_s'] - 1e-12 and requested > 1e-6
+                       and average @ normal <= block_spec['progress_ratio'] * requested)
+            opposing = (norm > 1e-6 and -force @ direction > block_spec['force_n']
+                        and (p - actual_p) @ direction > block_spec['error_m'] and stalled)
             block_time = block_time + dt if opposing else 0.
-            if block_time >= .01 - 1e-15:
-                candidate[:3] = 0.
-                blocked = True
+            block_deficit = block_deficit + (requested - average @ normal) * dt if opposing else 0.
+            deficit_confirmed = (block_time >= block_spec['deficit_confirm_s'] - 1e-15
+                                 and block_deficit >= block_spec['deficit_m'] - 1e-15)
+            if block_time >= block_spec['confirm_s'] - 1e-15 or deficit_confirmed:
+                candidate[:3] -= normal * max(float(candidate[:3] @ normal), 0.)
+                block_correction = -normal * max(float((p - actual_p) @ normal) - block_spec['error_m'], 0.)
+                p += block_correction
+                if np.linalg.norm(block_correction) > 1e-15:
+                    reanchor = True
+                    progress_start = progress_direction = None
+                    average, span, block_time, block_deficit = np.zeros(3), 0., 0., 0.
+                blocked = blocked_now = True
             cap = np.linalg.norm(p - actual_p) >= limits['pos_dev_m'] - 1e-6 or np.linalg.norm(so3_log(r @ actual_r.T)) >= limits['rot_dev_rad'] - 1e-5
             dev_time = dev_time + dt if cap else 0.
             if dev_time >= .1 - 1e-15:
                 p, r = actual_p.copy(), actual_r.copy()
                 candidate[:] = 0.
                 blocked = reanchor = True
-                block_time = dev_time = 0.
+                blocked_now = True
+                block_time = block_deficit = dev_time = 0.
+                progress_start = progress_direction = None
+                average, span = np.zeros(3), 0.
             box = config['workspace_box_m']
             for axis in range(3):
                 if abs(p[axis] + candidate[axis] * dt - origin[axis]) > box and abs(candidate[axis]) > 1e-15:
@@ -218,6 +270,9 @@ def check_reference_path(data, config, dt):
         equal('reference_correction_pos', k, correction)
         equal('reference_correction_rot', k, rotation_correction)
         reanchor |= np.linalg.norm(correction) > 1e-15 or rotation_correction > 1e-15
+        if np.linalg.norm(correction) > 1e-15 or rotation_correction > 1e-15:
+            progress_start = progress_direction = None
+            average, span, block_time, block_deficit = np.zeros(3), 0., 0., 0.
         velocity = np.zeros(6) if reanchor or not integrate else limited
         v_ref = np.zeros(6) if reanchor or not integrate else np.r_[(p - before_p) / dt, so3_log(r @ before_r.T) / dt]
         equal('v_ref', k, v_ref)
@@ -225,6 +280,9 @@ def check_reference_path(data, config, dt):
         equal('p_ref', k, p)
         equal('r_ref', k, r)
         equal('blocked', k, blocked)
+        equal('blocked_now', k, blocked_now)
+        equal('block_progress', k, np.r_[average, span, block_time, block_deficit])
+        equal('block_correction_pos', k, block_correction)
     return list(failures.values())
 
 
@@ -266,4 +324,3 @@ def expected_stimulus(case, times):
     if case.family == "plate": phase[(published>=.5)&(published<28.)]="ACQUIRE"
     if case.family == "mouth": phase[:]="APPROACH"
     return supplied, external, phase
-

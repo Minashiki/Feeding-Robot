@@ -29,6 +29,10 @@ NEGATIVES = {
     'food_choice': 'food_placement_attempt',
     'contact_witness': 'contact_stimulus',
     'external_sample': 'applied_wrench',
+    'progress_deficit': 'reference:block_progress', 'progress_velocity': 'reference:block_progress', 'progress_window': 'reference:block_progress',
+    'blocked_event': 'reference:blocked_now', 'blocked_backcalc': 'reference:block_correction_pos',
+    'loaded_actual_frozen': 'motion:loaded_circle_target',
+    'normal_blocked': 'normal_motion_blocked',
     'negative_flags': 'negative_results', 'negative_missing': 'negative_results',
 }
 
@@ -104,6 +108,9 @@ def mutate(run, name):
     elif name == 'sine_small': case = Case('sine')
     elif name.startswith('contact_') or name in {'tool_load', 'food_choice'}: case = Case('plate')
     if name == 'contact_witness': case = Case('stop', event='contact')
+    if name in {'progress_velocity', 'progress_window'}: case = Case('circle')
+    if name in {'blocked_event', 'blocked_backcalc'}: case = Case('wall')
+    if name in {'loaded_actual_frozen', 'normal_blocked'}: case = Case('loaded_circle', load=1.)
     source_id = case.manifest(3, 'A')['case_id']
     target_id = case.manifest(4, 'A')['case_id'] if name == 'seed_swap' else case.manifest(3, 'C')['case_id'] if name in {'solver_swap', 'duplicate_execution', 'missing_pair'} else source_id
     folder=run/'cases'
@@ -143,6 +150,13 @@ def mutate(run, name):
     elif name == 'reference_reanchor': data['reference_correction_pos'][2000, 0] += .001
     elif name == 'cancelled_command': data['twist_command'][2000, 0] = .01
     elif name == 'external_sample': data['applied_wrench_com'][2000, 0] += 1.
+    elif name == 'progress_deficit': data['block_progress'][2000, 5] += .002
+    elif name == 'progress_velocity': data['block_progress'][2000, 0] += .01
+    elif name == 'progress_window': data['block_progress'][2000, 3] += .01
+    elif name == 'blocked_event': data['blocked_now'][:] = False
+    elif name == 'blocked_backcalc': data['block_correction_pos'][:] = 0.
+    elif name == 'loaded_actual_frozen': data['tcp_pos'][:] = data['origin']
+    elif name == 'normal_blocked': data['blocked_now'][2000] = True
     elif name == 'contact_world': data['contact_force'][:] = 1000.
     elif name == 'contact_local': data['contact_force_contact'][:] = 1000.
     elif name == 'contact_frame': data['contact_frame'][:] = 0.

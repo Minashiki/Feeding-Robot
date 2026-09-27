@@ -770,7 +770,15 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
         if mode.size == 0 or str(mode[0]) != "POWER_ON":
             _add(reasons, "event_missing", case_id, "power_on")
     force_used = np.asarray(data["force_used"], dtype=float).reshape(n, 3)
-    rebuilt = _rebuild_blocked(command, force_used, pref, tcp, var["dt"])
+    config_path = run / "controller_config.json"
+    config = _load(config_path) if config_path.is_file() else {}
+    if config.get("version") == "m2-full-v5":
+        from feedingrobot.validation.m2.legacy import rebuild_progress_events
+        rebuilt, progress_errors = rebuild_progress_events(data, config, var["dt"])
+        for field in progress_errors:
+            _add(reasons, "event_mismatch", case_id, field)
+    else:
+        rebuilt = _rebuild_blocked(command, force_used, pref, tcp, var["dt"])
     if np.any(rebuilt & ~blocked):
         _add(reasons, "event_missing", case_id, "blocked_rebuild")
     if family in {"release", "release_fast"}:
@@ -1363,6 +1371,11 @@ def evaluate_evidence(run, check_workspace: bool = False) -> dict:
             _add(reasons, "nonfinite", field="controller_config.json")
         if cfg.get("hybrid_normal_force", {}).get("enabled") is not False or float(cfg.get("tau_rate_nm_s", 0)) != TAU_RATE:
             _add(reasons, "threshold_mismatch", field="controller_config")
+        if after is not None:
+            expected_hash = next((row['sha256'] for row in after.get('files', [])
+                                  if row['path'] == 'configs/m2_controller.json'), None)
+            if expected_hash != hashlib.sha256((run / 'controller_config.json').read_bytes()).hexdigest():
+                _add(reasons, "input_hash", field="controller_config.json")
     if (run / "comparisons.json").is_file():
         try:
             stored = _load(run / "comparisons.json")

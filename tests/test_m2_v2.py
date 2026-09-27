@@ -506,6 +506,8 @@ def _record_physical(case_id, scene, states, twists, infos, inputs, meta, extra=
         pause_applied=np.asarray(inputs["pause"], dtype=np.int8),
         saturation_flags=np.asarray(inputs["saturation"], dtype=np.int8),
         blocked_now=np.asarray(inputs["blocked"], dtype=np.int8),
+        block_progress=np.array([info["block_progress"] for info in infos]),
+        block_correction_pos=np.array([info["block_correction_pos"] for info in infos]),
         transition_active=np.asarray([1 if info["transition_active"] else 0 for info in infos], dtype=np.int8),
         warnings=np.asarray([int(np.sum(row["warnings"])) for row in states[1:]], dtype=int),
         first_fault_tick=np.int64(-1 if meta.get("first_fault_tick") is None else meta["first_fault_tick"]),

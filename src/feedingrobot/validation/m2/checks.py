@@ -62,6 +62,7 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
                     "raw_wrench_sensor": (n+1, 6), "qfrc_actuator": (n+1, 7), "tcp_twist": (n+1, 6),
                     "food_pos": (n+1, 3), "food_quat": (n+1, 4), "t": (n+1,), "tick": (n+1,)}
     interval_shapes = {"p_ref": (n,3), "r_ref": (n,3,3), "v_ref": (n,6), "external": (n,9), "supplied": (n,6),
+                       "blocked_now": (n,), "block_progress": (n,6), "block_correction_pos": (n,3),
                        "p_ref_before": (n,3), "r_ref_before": (n,3,3), "command_times": (n,2),
                        "arm_acceleration": (n,7), "candidate_twist": (n,6), "beta": (n,),
                        "external_body_com_before": (n,3), "applied_wrench_com": (n,6),
@@ -257,6 +258,8 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
     t = d["t"][1:]
     tail = t >= case.duration-1.-1e-9
     moving = (t >= 1.) & (t <= 9.)
+    if case.family in {'loaded_circle', 'spring', 'press', 'stiffness'}:
+        check(not np.any(d['blocked_now']), 'normal_motion_blocked')
     if case.family == "hold":
         check(rms(pe[tail]) <= .001 and rms(re[tail]) <= np.deg2rad(.5), "hold_error")
     elif case.family == "step":
@@ -333,6 +336,8 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
         check(not np.any(d["reference_correction_pos"]), "stiffness_clipped")
     elif case.family == "wall":
         check(len(contact_ticks)>0 and np.any(d["blocked"]), "wall_blocked")
+        confirmed = np.linalg.norm(d['block_correction_pos'], axis=1) > 1e-12
+        check(np.any(confirmed & d['blocked_now'].astype(bool)), 'wall_progress_blocked')
         check(np.max(d["fixture"][:,3]) >= .035, "wall_not_retracted")
         release = round(3./dt)
         span = slice(release,release+round(.5/dt)+1)

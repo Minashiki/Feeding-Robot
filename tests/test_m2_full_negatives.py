@@ -22,7 +22,7 @@ def test_full_counterexample_pipeline(tmp_path, monkeypatch):
     from feedingrobot.validation.m2.spec import Case, SCHEMA
     from feedingrobot.validation.m2.negatives import negative_nodes
     from feedingrobot.sim.model import repo_root
-    cases = [Case('stop', event='contact'), Case('circle'), Case('sine'), Case('plate'), Case('hold'), Case('stop', event='nan'), Case('stop', axis=1, sign=-1, event='expired', context='spring')]
+    cases = [Case('stop', event='contact'), Case('circle'), Case('sine'), Case('plate'), Case('hold'), Case('stop', event='nan'), Case('stop', axis=1, sign=-1, event='expired', context='spring'), Case('wall'), Case('loaded_circle', load=1.)]
     monkeypatch.setattr(a, 'cases', lambda: cases)
     monkeypatch.setattr(a, 'CALIBRATION_SEEDS', (0,))
     monkeypatch.setattr(a, 'FORMAL_SEEDS', (3, 4))
