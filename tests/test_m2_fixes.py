@@ -50,7 +50,7 @@ def test_f5_interrupted_blend_stays_continuous():
     ctl._tcp_rot = state["tcp_mat"]
     ctl._update_gains(0.05)
     mid = ctl._k.copy()
-    assert abs(mid[0] - (0.75 * 300 + 0.25 * 100)) < 1e-9
+    assert abs(mid[0] - (0.75 * 330 + 0.25 * 100)) < 1e-9
     ctl.phase = "ACQUIRE"
     before = ctl._k.copy()
     ctl._update_gains(0.001)
@@ -61,7 +61,7 @@ def test_f5_interrupted_blend_stays_continuous():
     for _ in range(250):
         ctl._update_gains(0.001)
     assert abs(ctl.effective_limits()["v"] - 0.05) < 1e-12
-    assert abs(ctl._k[0] - 300) < 1e-9
+    assert abs(ctl._k[0] - 330) < 1e-9
 
 
 def test_f5_repeat_command_does_not_restart():
@@ -158,10 +158,10 @@ def test_v2_f5_return_to_free_is_continuous():
     ctl._tcp_pos = state["tcp_pos"]
     ctl._tcp_rot = state["tcp_mat"]
     ctl._update_gains(0.05)
-    assert abs(ctl._k[0] - 250.0) < 1e-9
+    assert abs(ctl._k[0] - 272.5) < 1e-9
     ctl.phase = "TRANSPORT"
     ctl._update_gains(0.001)
-    assert abs(ctl._k[0] - 250.25) < 1e-9
+    assert abs(ctl._k[0] - 272.7875) < 1e-9
     ctl2, _g2 = start_controller(scene, cfg, state)
     ctl2.power_on = False
     ctl2.phase = "APPROACH"
@@ -170,7 +170,7 @@ def test_v2_f5_return_to_free_is_continuous():
     ctl2._update_gains(0.05)
     ctl2.phase = "TRANSPORT"
     ctl2._update_gains(0.0005)
-    assert abs(ctl2._k[0] - 250.125) < 1e-9
+    assert abs(ctl2._k[0] - 272.64375) < 1e-9
 
 
 def test_v2_f6_pause_still_limits_deviation():

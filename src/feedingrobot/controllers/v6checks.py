@@ -66,12 +66,13 @@ STOP_DURATION_S = 1.0
 class CheckContext:
     """Owned by one evaluation; never shared between concurrent calls."""
 
-    def __init__(self):
+    def __init__(self, controller_version=None):
         import mujoco
         from feedingrobot.sim.scene import FeedingScene
 
         self.scene = FeedingScene("configs/m1_scene.json")
         self.mujoco = mujoco
+        self.controller_version = controller_version
 
     @property
     def ranges(self):
@@ -297,7 +298,7 @@ def check_trace(case_id: str, data, meta: dict, context=None, metrics=None) -> l
         reasons.append(_reason("joint_range", case_id, "q"))
     events = {}
     if case_id.startswith("V6-zero-phys-"):
-        reasons.extend(semantic_arrays(data, case_id, "base", dt))
+        reasons.extend(semantic_arrays(data, case_id, "base", dt, context.controller_version))
         if int(data["fault_tick"]) != -1 or str(data["fault_reason"]) != "" or int(data["stopped_ok"]) != 0:
             reasons.append(_reason("unexpected_fault", case_id, "fault_tick"))
         reasons.extend(_check_zero_trace(case_id, data, q, dq, command, execution, guard_status, v_ref, tau_applied, tau_before, dt, n, context))
@@ -528,6 +529,7 @@ def _check_stop_trace(
             dt,
             case_id,
             reasons,
+            controller_version=context.controller_version,
         )
         if built is not None and (np.any(np.linalg.norm(v_ref[prefix, :3], axis=1) > built["v_lim"] + 1e-9) or np.any(np.linalg.norm(v_ref[prefix, 3:], axis=1) > built["w_lim"] + 1e-9)):
             reasons.append(_reason("reference_speed", case_id, "v_ref"))

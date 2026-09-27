@@ -117,7 +117,7 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
         if case.family in {"press","stiffness"}: expected_k[:,:3] = case.stiffness
         stopped = d["execution"] == "stop"
         expected_k[stopped],expected_d[stopped] = 0.,0.
-        expected_d[d["execution"] == "power_on"] *= 8.
+        expected_d[d["execution"] == "power_on"] *= 12.
         check(np.allclose(d["k"],expected_k,atol=1e-9,rtol=0),"gain_k")
         check(np.allclose(d["d"],expected_d,atol=1e-9,rtol=0),"gain_d")
     for key, array in d.items():

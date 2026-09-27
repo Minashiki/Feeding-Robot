@@ -125,7 +125,7 @@ def test_loaded_motion_uses_fixed_physical_compliance_center(mutation):
     angle = .5*np.pi*np.clip(t-1., 0., 8.)
     target = np.column_stack([.01*(np.cos(angle)-1.), .01*np.sin(angle), np.zeros(len(t))])
     actual = target.copy()
-    actual[t>1., 0] += 1./300.
+    actual[t>1., 0] += 1./330.
     rotation = np.tile(np.eye(3), (len(t), 1, 1))
     if mutation == 'frozen': actual[:] = 0.
     if mutation == 'partial': actual[500:] = actual[499]

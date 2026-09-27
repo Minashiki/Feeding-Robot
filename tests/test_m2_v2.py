@@ -186,7 +186,7 @@ def test_f5_return_limits(case_id, rig):
         ctl._update_gains(0.001)
     after = float(ctl.effective_limits()["v"])
     assert abs(after - 0.05) < 1e-12
-    assert abs(ctl._k[0] - 300.0) < 1e-9
+    assert abs(ctl._k[0] - 330.0) < 1e-9
     write_json(case_id, {"limit_during": during, "limit_after": after})
 
 

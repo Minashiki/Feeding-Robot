@@ -244,7 +244,7 @@ def digest(path):
 def inputs():
     rows=collect_inputs()['files']
     root=repo_root()
-    extras=['assets/tests/m2_full_surface.xml','assets/tests/m2_full_wall.xml','M2Plan.md','SimModelPlan.md','docs/m2_interface.md','docs/m2_acceptance.md','docs/m2_recovery.md','M2AcceptanceRefactorPlan.md']
+    extras=['assets/tests/m2_full_surface.xml','assets/tests/m2_full_wall.xml','M2Plan.md','SimModelPlan.md','docs/m2_interface.md','docs/m2_calibration.md','docs/m2_acceptance.md','docs/m2_recovery.md','M2AcceptanceRefactorPlan.md']
     return sorted(rows+[{'path':p,'sha256':digest(root/p)} for p in extras],key=lambda r:r['path'])
 
 

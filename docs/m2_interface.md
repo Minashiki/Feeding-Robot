@@ -40,3 +40,7 @@ reset 后力矩从给定的 `tau_applied`（场景复位后为 0）按变化率�
 步进前的 `finite=false`、已有 MuJoCo warning 或控制所需状态/原始 wrench 非有限值，在任何 `mj_forward` 前拒绝：锁存 ABORTED、取消命令、`apply=false`，当前及后续调用不推进 tick/time。`compute` 与 `control_step` 使用同一预检。未知 phase 在修改状态前抛出 `ValueError`；None 保持原义。完整验收与 full-v5 证据格式见 `docs/m2_acceptance.md`。
 
 受阻进展与回算参数见 M2Plan 第5.4节：有效命令的方向/幅值用于判定意图，整形候选用于实际裁切。`blocked_now` 与历史 `blocked` 分开；`block_progress` 和 `block_correction_pos` 提供独立重建所需证据。停止、reset和档位切换清除新增进展历史。
+
+FREE参数标定配置`m2-full-v5-tracking5`使用平移K=330 N/m、D=40 N·s/m；ACQUIRE/MOUTH、旋转、受阻与STOP契约保持。证据数组仍为full-v5，以配置版本与冻结哈希区分参数契约；标定/S5不构成M3放行。
+
+最终跟踪候选还将`power_on_damping_scale`从8标定为12：该现有倍率仅在POWER_ON作用于六维阻尼，正常运行退出该倍率；FREE基值330/40、其他档位及旋转基值如表，STOP独立阻尼12不变。上电阶段实际旋转阻尼也随倍率增加，必须一并通过姿态、速度与力矩限制。失败中间候选按各自冻结源码复核，当前检查器仅承诺原正式300/49与最终330/40版本契约。

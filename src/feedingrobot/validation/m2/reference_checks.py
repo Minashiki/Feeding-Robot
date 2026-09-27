@@ -97,24 +97,31 @@ def check_analytic_motion(case, data):
     moving = (t >= 1.) & (t <= 9.)
     angle = .5 * np.pi * np.clip(t - 1., 0., 8.)
     failures = []
+    def check_error(error, code, rms_limit, max_limit):
+        rms = float(np.sqrt(np.mean(error**2)))
+        maximum = float(np.max(error))
+        if rms > rms_limit or maximum > max_limit:
+            metric = 'rms' if rms > rms_limit else 'maximum'
+            failures.append({'code': code, 'metric': metric,
+                             'observed': rms if metric == 'rms' else maximum,
+                             'limit': rms_limit if metric == 'rms' else max_limit,
+                             'rms': rms, 'maximum': maximum,
+                             'rms_limit': rms_limit, 'max_limit': max_limit})
     if case.family in {'circle', 'loaded_circle'}:
         target = data['origin'] + np.column_stack((
             .01 * (np.cos(angle) - 1.), .01 * np.sin(angle), np.zeros(len(t))))
         error = np.linalg.norm(data['p_ref'] - target, axis=1)[moving]
-        if np.sqrt(np.mean(error**2)) > .002 or np.max(error) > .005:
-            failures.append({'code': 'reference:circle_target', 'observed': float(np.max(error))})
+        check_error(error, 'reference:circle_target', .002, .005)
         actual_target = target.copy()
         if case.family == 'loaded_circle':
             actual_target[t > 1., case.axis] += case.sign * case.load / GEAR_K['FREE'][case.axis]
         error = np.linalg.norm(data['tcp_pos'][1:] - actual_target, axis=1)[moving]
-        if np.sqrt(np.mean(error**2)) > .002 or np.max(error) > .005:
-            failures.append({'code': 'motion:' + case.family + '_target', 'observed': float(np.max(error))})
+        check_error(error, 'motion:' + case.family + '_target', .002, .005)
         if case.family == 'loaded_circle':
             from feedingrobot.controllers.so3 import so3_log
             error = np.array([np.linalg.norm(so3_log(r @ data['rotation'].T))
                               for r in data['tcp_mat'][1:][moving]])
-            if np.sqrt(np.mean(error**2)) > np.deg2rad(1) or np.max(error) > np.deg2rad(3):
-                failures.append({'code': 'motion:loaded_circle_rotation', 'observed': float(np.max(error))})
+            check_error(error, 'motion:loaded_circle_rotation', np.deg2rad(1), np.deg2rad(3))
     else:
         from feedingrobot.controllers.so3 import so3_log
         target = np.pi / 60 * np.sin(angle)
@@ -124,8 +131,7 @@ def check_analytic_motion(case, data):
             expected = np.zeros_like(displacement)
             expected[:, case.axis] = target
             error = np.linalg.norm(displacement - expected, axis=1)[moving]
-            if np.sqrt(np.mean(error**2)) > np.deg2rad(1) or np.max(error) > np.deg2rad(3):
-                failures.append({'code': code, 'observed': float(np.max(error))})
+            check_error(error, code, np.deg2rad(1), np.deg2rad(3))
     return failures
 
 

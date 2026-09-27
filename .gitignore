@@ -8,6 +8,7 @@ build/
 outputs/
 .mujoco/
 .cursor/
+.codex/
 机械臂复杂控制文献调研.md
 IdealModelPlan.md
 M1Plan.md
@@ -21,3 +22,4 @@ M2FixPlanV3.md
 M2FixPlanV4.md
 M2FixPlanV5.md
 M2FixPlanV6.md
+M2AcceptanceRefactorPlan.md

@@ -12,7 +12,7 @@ from feedingrobot.validation.m2.provenance import identity
 NEGATIVES = {
     'late_stop': 'late_stop', 'ordinary_stop': 'unexpected_stop', 'valid_nan': 'valid_nan',
     'abort_step': 'abort_advanced', 'missing_case': 'case_files', 'missing_pair': 'case_files',
-    'torque_limit': 'torque_limit', 'gain': 'gain_k', 'stimulus': 'command_stimulus',
+    'torque_limit': 'torque_limit', 'gain': 'gain_k', 'damping': 'gain_d', 'startup_damping': 'gain_d', 'stimulus': 'command_stimulus',
     'event_shift': 'first_fault', 'seed_swap': 'execution_identity', 'solver_swap': 'execution_identity',
     'duplicate_execution': 'duplicate_execution', 'effective_config': 'effective_config',
     'config_snapshot': 'config_snapshot', 'missing_test': 'regression_nodes',
@@ -103,7 +103,7 @@ def mutate(run, name):
             rows = read(run/filename)
             write(run/filename, [row for row in rows if not row['path'].startswith('src/feedingrobot/validation/')])
         return
-    case = Case('stop', event='nan') if name == 'abort_step' else Case('hold') if name == 'ordinary_stop' else Case('stop', axis=1, sign=-1, event='expired', context='spring')
+    case = Case('stop', event='nan') if name == 'abort_step' else Case('hold') if name in {'ordinary_stop', 'startup_damping'} else Case('stop', axis=1, sign=-1, event='expired', context='spring')
     if name.startswith('circle_') or name in {'reference_velocity', 'reference_reanchor', 'forged_block', 'command_clock'}: case = Case('circle')
     elif name == 'sine_small': case = Case('sine')
     elif name.startswith('contact_') or name in {'tool_load', 'food_choice'}: case = Case('plate')
@@ -132,6 +132,8 @@ def mutate(run, name):
     elif name=='abort_step':meta['abort_probe']['tick_after']+=1
     elif name=='torque_limit':data['tau_cmd'][100,0]=100.
     elif name=='gain':data['k'][100,0]+=1.
+    elif name=='damping':data['d'][100,:3]=49.
+    elif name=='startup_damping':data['d'][0] *= 8./12.
     elif name=='stimulus':data['supplied'][100,0]+=.1
     elif name=='event_shift':meta['fault']['tick']+=1
     elif name=='effective_config':meta['effective_controller']['gears']['FREE']['kp']=99999.

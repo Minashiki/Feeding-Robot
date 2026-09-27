@@ -760,5 +760,15 @@
   "tests/test_m2_blocked_stop.py::test_valid_withdrawal_after_wall_release[C]",
   "tests/test_m2_reference_evidence.py::test_dropped_reference_motion_is_rejected[loaded_circle]",
   "tests/test_m2_reference_evidence.py::test_wall_faults_are_rejected[disabled_block]",
-  "tests/test_m2_reference_evidence.py::test_wall_faults_are_rejected[replayed_command]"
+  "tests/test_m2_reference_evidence.py::test_wall_faults_are_rejected[replayed_command]",
+  "tests/test_m2_tracking_calibration.py::test_loaded_circle_failure_reports_triggering_metric[rms]",
+  "tests/test_m2_tracking_calibration.py::test_loaded_circle_failure_reports_triggering_metric[maximum]",
+  "tests/test_m2_tracking_calibration.py::test_loaded_circle_failure_reports_triggering_metric[both]",
+  "tests/test_m2_tracking_calibration.py::test_loaded_circle_failure_reports_triggering_metric[none]",
+  "tests/test_m2_tracking_calibration.py::test_legacy_gain_profile_and_blend_are_version_bound[m2-full-v5-300.0-49.0-0.001]",
+  "tests/test_m2_tracking_calibration.py::test_legacy_gain_profile_and_blend_are_version_bound[m2-full-v5-300.0-49.0-0.0005]",
+  "tests/test_m2_tracking_calibration.py::test_legacy_gain_profile_and_blend_are_version_bound[m2-full-v5-tracking5-330.0-40.0-0.001]",
+  "tests/test_m2_tracking_calibration.py::test_legacy_gain_profile_and_blend_are_version_bound[m2-full-v5-tracking5-330.0-40.0-0.0005]",
+  "tests/test_m2_tracking_calibration.py::test_legacy_unit_gain_target_is_version_bound[m2-full-v5-300.0-49.0]",
+  "tests/test_m2_tracking_calibration.py::test_legacy_unit_gain_target_is_version_bound[m2-full-v5-tracking5-330.0-40.0]"
 ]

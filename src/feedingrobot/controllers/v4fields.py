@@ -301,7 +301,7 @@ def hard_arrays(data, case_id: str, family: str, dt: float) -> list[dict]:
     return reasons
 
 
-def semantic_arrays(data, case_id: str, family: str, dt: float) -> list[dict]:
+def semantic_arrays(data, case_id: str, family: str, dt: float, controller_version=None) -> list[dict]:
     reasons = []
     layout = model_layout(family)
     q = np.array(data["q"], dtype=float)
@@ -340,7 +340,7 @@ def semantic_arrays(data, case_id: str, family: str, dt: float) -> list[dict]:
     warnings = np.array(data["warnings"])
     if fault != -1 or np.any(warnings != 0):
         reasons.append(_reason("unexpected_fault", case_id, "first_fault_tick", fault, -1))
-    built = check_logged_gains(K, D, trans, active, target, phase, dt, case_id, reasons, require_acquire=family == "gear")
+    built = check_logged_gains(K, D, trans, active, target, phase, dt, case_id, reasons, require_acquire=family == "gear", controller_version=controller_version)
     v_ref = np.array(data["v_ref"], dtype=float)
     pause = np.array(data["pause_applied"]).astype(int) == 1
     held = pause | np.isin(execution, ["power_on", "stop", "prohibit"])
@@ -357,13 +357,18 @@ def semantic_arrays(data, case_id: str, family: str, dt: float) -> list[dict]:
     return reasons
 
 
-def rebuild_gain_path(phase, dt: float, initial_phase: str = "TRANSPORT") -> dict:
+def rebuild_gain_path(phase, dt: float, initial_phase: str = "TRANSPORT", controller_version=None) -> dict:
     """Expected gains from the case's initial phase and the logged phase. Logged gears are not inputs."""
     phase = np.asarray(phase).astype(str)
     n = int(phase.shape[0])
     init = GEAR_OF[str(initial_phase)]
-    expected_k = GEAR_K[init].copy()
-    expected_d = GEAR_D[init].copy()
+    stiffness = {gear: value.copy() for gear, value in GEAR_K.items()}
+    damping = {gear: value.copy() for gear, value in GEAR_D.items()}
+    if controller_version == "m2-full-v5-tracking5":
+        stiffness["FREE"][:3] = 330.0
+        damping["FREE"][:3] = 40.0
+    expected_k = stiffness[init].copy()
+    expected_d = damping[init].copy()
     completed = init
     desired_prev = init
     in_transition = False
@@ -405,19 +410,19 @@ def rebuild_gain_path(phase, dt: float, initial_phase: str = "TRANSPORT") -> dic
         if in_transition:
             elapsed = min(BLEND_S, elapsed + float(dt))
             if elapsed >= BLEND_S - BLEND_TIME_TOL_S:
-                expected_k = GEAR_K[desired].copy()
-                expected_d = GEAR_D[desired].copy()
+                expected_k = stiffness[desired].copy()
+                expected_d = damping[desired].copy()
                 completed = desired
                 in_transition = False
                 if desired == "ACQUIRE" and acquire_done is None:
                     acquire_done = k
             else:
                 alpha = elapsed / BLEND_S
-                expected_k = (1.0 - alpha) * start_k + alpha * GEAR_K[desired]
-                expected_d = (1.0 - alpha) * start_d + alpha * GEAR_D[desired]
+                expected_k = (1.0 - alpha) * start_k + alpha * stiffness[desired]
+                expected_d = (1.0 - alpha) * start_d + alpha * damping[desired]
         else:
-            expected_k = GEAR_K[desired].copy()
-            expected_d = GEAR_D[desired].copy()
+            expected_k = stiffness[desired].copy()
+            expected_d = damping[desired].copy()
             completed = desired
         out_k[k] = expected_k
         out_d[k] = expected_d
@@ -441,8 +446,8 @@ def rebuild_gain_path(phase, dt: float, initial_phase: str = "TRANSPORT") -> dic
     }
 
 
-def check_logged_gains(K, D, trans, active, target, phase, dt, case_id, reasons, initial_phase="TRANSPORT", require_acquire=False):
-    built = rebuild_gain_path(phase, dt, initial_phase)
+def check_logged_gains(K, D, trans, active, target, phase, dt, case_id, reasons, initial_phase="TRANSPORT", require_acquire=False, controller_version=None):
+    built = rebuild_gain_path(phase, dt, initial_phase, controller_version)
     if built.get("error"):
         reasons.append(_reason("invalid_enum", case_id, "phase", index=built["index"]))
         return None

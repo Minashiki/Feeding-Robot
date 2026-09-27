@@ -362,7 +362,7 @@ def _check_f6_json(case_id: str, row: dict, reasons: list) -> None:
             _add(reasons, "missing_field", case_id, "execution")
 
 
-def _check_unit(case_id: str, row: dict, reasons: list) -> None:
+def _check_unit(case_id: str, row: dict, reasons: list, controller_version=None) -> None:
     if not isinstance(row, dict) or row.get("case_id") != case_id:
         _add(reasons, "missing_field", case_id, "case_id")
         return
@@ -402,8 +402,12 @@ def _check_unit(case_id: str, row: dict, reasons: list) -> None:
             return
         if abs(float(row["dt"]) - dt) > 1e-15:
             _add(reasons, "threshold_mismatch", case_id, "dt", row["dt"], dt)
-        target = GEAR_GAIN[src]
-        other = GEAR_GAIN[dst]
+        gains_by_gear = {gear: value.copy() for gear, value in GEAR_GAIN.items()}
+        if controller_version == "m2-full-v5-tracking5":
+            gains_by_gear["FREE"][0] = 330.0
+            gains_by_gear["FREE"][2] = 40.0
+        target = gains_by_gear[src]
+        other = gains_by_gear[dst]
         if "k_target" in row and np.max(np.abs(_nums(row["k_target"]) - target)) > 1e-9:
             _add(reasons, "threshold_mismatch", case_id, "k_target")
         allow = np.abs(target - other) * dt / 0.2 + 1e-9
@@ -553,7 +557,10 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
             _add(reasons, "event_missing", case_id, "release_window")
         return None
     reasons.extend(hard_arrays(data, case_id, family, var["dt"]))
-    reasons.extend(semantic_arrays(data, case_id, family, var["dt"]))
+    config_path = run / "controller_config.json"
+    config = _load(config_path) if config_path.is_file() else {}
+    controller_version = config.get("version")
+    reasons.extend(semantic_arrays(data, case_id, family, var["dt"], controller_version))
     needed = (
         "t_state",
         "tick",
@@ -747,7 +754,7 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
                 _add(reasons, "event_missing", case_id, "switch_speed", switch_speed, 0.02)
         from feedingrobot.controllers.v4fields import rebuild_gain_path
 
-        built = rebuild_gain_path(phase, var["dt"])
+        built = rebuild_gain_path(phase, var["dt"], controller_version=controller_version)
         done = built.get("acquire_done")
         logged_k = np.asarray(data["K"], dtype=float)
         logged_d = np.asarray(data["D"], dtype=float)
@@ -770,9 +777,7 @@ def _check_physical(case_id: str, run: Path, reasons: list) -> dict | None:
         if mode.size == 0 or str(mode[0]) != "POWER_ON":
             _add(reasons, "event_missing", case_id, "power_on")
     force_used = np.asarray(data["force_used"], dtype=float).reshape(n, 3)
-    config_path = run / "controller_config.json"
-    config = _load(config_path) if config_path.is_file() else {}
-    if config.get("version") == "m2-full-v5":
+    if controller_version in {"m2-full-v5", "m2-full-v5-tracking5"}:
         from feedingrobot.validation.m2.legacy import rebuild_progress_events
         rebuilt, progress_errors = rebuild_progress_events(data, config, var["dt"])
         for field in progress_errors:
@@ -1252,7 +1257,11 @@ def evaluate_evidence(run, check_workspace: bool = False) -> dict:
     _manifest_ok(run, reasons)
     from feedingrobot.controllers.v6checks import CheckContext
 
-    context = CheckContext()
+    try:
+        controller_version = _load(run / "controller_config.json").get("version") if (run / "controller_config.json").is_file() else None
+    except ValueError:
+        controller_version = None  # The configuration check below reports the invalid JSON.
+    context = CheckContext(controller_version)
     metrics = {}
     if (run / "cases").is_dir():
         known = set(expected)
@@ -1303,7 +1312,7 @@ def evaluate_evidence(run, check_workspace: bool = False) -> dict:
                     if not target.is_file():
                         _add(reasons, "missing_case", case_id, "json")
                     else:
-                        _check_unit(case_id, _load(target), reasons)
+                        _check_unit(case_id, _load(target), reasons, controller_version)
             except ValueError:
                 _add(reasons, "nonfinite", case_id, "parse")
             except (OSError, KeyError, TypeError):
@@ -1628,9 +1637,12 @@ def apply_tamper(name: str, run: Path) -> None:
             payload["tcp_twist"][400:, 0] = 0.2
         _edit_case(run, "release_fast-s0-A", _speed)
     elif name == "gear_fake_free":
+        version = _load(run / "controller_config.json").get("version")
+        free_kp = 330.0 if version == "m2-full-v5-tracking5" else 300.0
+        free_dp = 40.0 if version == "m2-full-v5-tracking5" else 49.0
         def _fake_free(payload):
-            payload["K"][:] = np.array([300.0, 300.0, 300.0, 8.0, 8.0, 8.0], dtype=payload["K"].dtype)
-            payload["D"][:] = np.array([49.0, 49.0, 49.0, 0.8, 0.8, 0.8], dtype=payload["D"].dtype)
+            payload["K"][:] = np.array([free_kp, free_kp, free_kp, 8.0, 8.0, 8.0], dtype=payload["K"].dtype)
+            payload["D"][:] = np.array([free_dp, free_dp, free_dp, 0.8, 0.8, 0.8], dtype=payload["D"].dtype)
             payload["transition_active"][:] = 0
             payload["active_gear"][:] = "FREE"
             payload["target_gear"][:] = "FREE"

@@ -9,6 +9,7 @@ import pytest
 from feedingrobot.controllers.acceptance import V6_SECOND_STAGE_NODEIDS
 from feedingrobot.controllers.v3spec import _abc, check_release_stimulus, check_second_stage
 from feedingrobot.controllers.v6checks import CheckContext, check_trace, check_zero_grid
+from tests.m2_support import load_m2_config
 from tests.test_m2_v6 import _trace, test_zero_projection_grid as make_grid
 
 
@@ -38,7 +39,7 @@ def read(root, case):
 def test_v6_common_contracts(traces):
     case = "V6-zero-phys-upper-A"
     original, meta = read(traces, case)
-    context = CheckContext()
+    context = CheckContext(load_m2_config()["version"])
     assert check_trace(case, original, meta, context) == []
     def tau_limit(data):
         data["tau_applied"][:, 6] = np.minimum(np.arange(len(data["command"])) + 1, 50)
@@ -65,7 +66,7 @@ def test_v6_common_contracts(traces):
 def test_v6_fixed_grid_contract(traces):
     case = "V6-zero-j0-upper-linear-A"
     row = json.loads((traces / f"{case}.json").read_text())
-    context = CheckContext()
+    context = CheckContext(load_m2_config()["version"])
     assert check_zero_grid(case, row, context) == []
     for field, value in (("jbar", np.zeros((7, 6)).tolist()), ("candidate", [0.] * 6), ("q", [0.] * 7), ("dt", 0.0005)):
         altered = copy.deepcopy(row)
@@ -118,7 +119,7 @@ def test_v6_second_stage_nodes():
 
 
 def test_v6_pair_contracts(traces):
-    context = CheckContext()
+    context = CheckContext(load_m2_config()["version"])
     metrics = {}
     for path in sorted(traces.glob("*.npz")):
         data, meta = read(traces, path.stem)
