@@ -165,14 +165,20 @@ def compare(left, right):
         failures.append({'code': 'variant_pair'})
     for key, floor in (("position_rms",.0001),("rotation_rms",np.deg2rad(.05)),("tracking_position_rms",.0001),("tracking_rotation_rms",np.deg2rad(.05)),("force_peak",.02),("force_mean",.02),("moment_peak",.002),("tau_peak",.05),("impulse",1e-4),("contact_force_peak",.02),("contact_moment_peak",.002),("contact_impulse",1e-4)):
         a,b = np.asarray(left[key]),np.asarray(right[key])
-        if np.any(np.abs(a-b)>np.maximum(.1*np.maximum(np.abs(a),np.abs(b)),floor)+1e-12):
+        if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))) or np.any(np.abs(a-b)>np.maximum(.1*np.maximum(np.abs(a),np.abs(b)),floor)+1e-12):
             failures.append({"code":"convergence:"+key,"left":a.tolist(),"right":b.tolist()})
+    if left.get('family') in {'spring', 'press'} or right.get('family') in {'spring', 'press'}:
+        a, b = left.get('contact_force_mean'), right.get('contact_force_mean')
+        if a is None or b is None:
+            failures.append({'code': 'missing_metric:contact_force_mean'})
+        elif not (np.isfinite(a) and np.isfinite(b)) or abs(a-b) > max(.1*max(abs(a),abs(b)), .02)+1e-12:
+            failures.append({'code': 'convergence:contact_force_mean', 'left': a, 'right': b})
     for key in ("initial_qpos","initial_qvel"):
         if not np.array_equal(left[key],right[key]): failures.append({"code":"initial_pair:"+key})
     if set(left["events"]) != set(right["events"]):
         failures.append({"code":"event_pair"})
     else:
         for event in left["events"]:
-            if abs(left["events"][event]-right["events"][event]) > .020+1e-12:
+            if not (np.isfinite(left['events'][event]) and np.isfinite(right['events'][event])) or abs(left["events"][event]-right["events"][event]) > .020+1e-12:
                 failures.append({"code":"event_time:"+event})
     return failures

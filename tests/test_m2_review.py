@@ -195,9 +195,18 @@ def test_calibration_package_fail_closed(identity_trace, tmp_path, monkeypatch):
     monkeypatch.setattr(runner, 'run_group', forbid)
     before_verify = {str(p.relative_to(tmp_path)): a.digest(p) for p in tmp_path.rglob('*') if p.is_file()}
     assert a.evaluate(tmp_path, calibration=True, check_workspace=True) == core
+    from feedingrobot.scripts.verify_m2_report import assess_m2, main
+    import sys
+    assert assess_m2(tmp_path, 'calibration', True) == core
+    monkeypatch.setattr(sys, 'argv', ['verify_m2_report', '--run', str(tmp_path),
+                                    '--scope', 'calibration', '--check-current-workspace'])
+    main()
     assert before_verify == {str(p.relative_to(tmp_path)): a.digest(p) for p in tmp_path.rglob('*') if p.is_file()}
     write('report.json', {**core, 'm3_ready': True})
     assert 'report_mismatch' in {r['code'] for r in a.evaluate(tmp_path, calibration=True)['reasons']}
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 1
     write('report.json', core)
     cfg=json.loads((tmp_path/'m2_controller.json').read_text())
     cfg['gears']['FREE']['kp']=99999.

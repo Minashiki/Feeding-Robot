@@ -33,6 +33,8 @@ NEGATIVES = {
     'blocked_event': 'reference:blocked_now', 'blocked_backcalc': 'reference:block_correction_pos',
     'loaded_actual_frozen': 'motion:loaded_circle_target',
     'normal_blocked': 'normal_motion_blocked',
+    'blocked_force_evidence': 'wall_progress_blocked',
+    'steady_contact_pair': 'convergence:contact_force_mean',
     'negative_flags': 'negative_results', 'negative_missing': 'negative_results',
 }
 
@@ -110,6 +112,8 @@ def mutate(run, name):
     if name == 'contact_witness': case = Case('stop', event='contact')
     if name in {'progress_velocity', 'progress_window'}: case = Case('circle')
     if name in {'blocked_event', 'blocked_backcalc'}: case = Case('wall')
+    if name == 'blocked_force_evidence': case = Case('wall')
+    if name == 'steady_contact_pair': case = Case('spring')
     if name in {'loaded_actual_frozen', 'normal_blocked'}: case = Case('loaded_circle', load=1.)
     source_id = case.manifest(3, 'A')['case_id']
     target_id = case.manifest(4, 'A')['case_id'] if name == 'seed_swap' else case.manifest(3, 'C')['case_id'] if name in {'solver_swap', 'duplicate_execution', 'missing_pair'} else source_id
@@ -159,6 +163,12 @@ def mutate(run, name):
     elif name == 'blocked_backcalc': data['block_correction_pos'][:] = 0.
     elif name == 'loaded_actual_frozen': data['tcp_pos'][:] = data['origin']
     elif name == 'normal_blocked': data['blocked_now'][2000] = True
+    elif name == 'blocked_force_evidence': data['ft_compensated_wrench_tcp'][:, :3] = 0.
+    elif name == 'steady_contact_pair':
+        for tick in np.flatnonzero((data['t'][1:] >= 5.25) & (data['t'][1:] <= 6.25)):
+            start, end = data['contact_offsets'][tick:tick+2]
+            for field in ('contact_force', 'contact_force_contact', 'contact_wrench_contact', 'contact_wrench_world'):
+                data[field][start:end] *= 2.
     elif name == 'contact_world': data['contact_force'][:] = 1000.
     elif name == 'contact_local': data['contact_force_contact'][:] = 1000.
     elif name == 'contact_frame': data['contact_frame'][:] = 0.

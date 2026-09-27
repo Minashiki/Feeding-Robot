@@ -22,7 +22,7 @@ def test_full_counterexample_pipeline(tmp_path, monkeypatch):
     from feedingrobot.validation.m2.spec import Case, SCHEMA
     from feedingrobot.validation.m2.negatives import negative_nodes
     from feedingrobot.sim.model import repo_root
-    cases = [Case('stop', event='contact'), Case('circle'), Case('sine'), Case('plate'), Case('hold'), Case('stop', event='nan'), Case('stop', axis=1, sign=-1, event='expired', context='spring'), Case('wall'), Case('loaded_circle', load=1.)]
+    cases = [Case('stop', event='contact'), Case('circle'), Case('sine'), Case('plate'), Case('hold'), Case('stop', event='nan'), Case('stop', axis=1, sign=-1, event='expired', context='spring'), Case('wall'), Case('loaded_circle', load=1.), Case('spring')]
     monkeypatch.setattr(a, 'cases', lambda: cases)
     monkeypatch.setattr(a, 'CALIBRATION_SEEDS', (0,))
     monkeypatch.setattr(a, 'FORMAL_SEEDS', (3, 4))
@@ -71,6 +71,13 @@ def test_full_counterexample_pipeline(tmp_path, monkeypatch):
     assert not a.evaluate(source)['m3_ready']  # staged packages never release
     completed = a.finalize(source)
     assert completed['scope_passed'] and completed['m3_ready'], completed['reasons'][:10]
+    from feedingrobot.scripts.verify_m2_report import main
+    import sys
+    monkeypatch.setattr(sys, 'argv', ['verify_m2_report', '--run', str(source),
+                                    '--scope', 'full', '--check-current-workspace'])
+    before_verify = {str(p.relative_to(source)): a.digest(p) for p in source.rglob('*') if p.is_file()}
+    main()  # Reduced test fixture with the declared prerequisite stub, never S6 evidence.
+    assert before_verify == {str(p.relative_to(source)): a.digest(p) for p in source.rglob('*') if p.is_file()}
     payload['results'][0]['actual']=[]
     write(source/'negative_results.json',payload)
     assert check_negatives(source)

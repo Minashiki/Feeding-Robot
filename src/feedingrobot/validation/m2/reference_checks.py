@@ -136,19 +136,20 @@ def check_analytic_motion(case, data):
 
 
 def check_reference_path(data, config, dt):
-    """Reconstruct the reference update from command, physical triggers and bounds."""
+    """Return failures and independently reconstructed first-event times at t_k."""
     from feedingrobot.controllers.so3 import so3_exp, so3_log
     def bound(value, limit):
         norm = np.linalg.norm(value)
         return value * min(1., limit / max(norm, 1e-30))
     failures = {}
+    events = {}
     def equal(field, k, expected, tolerance=1e-8):
         if not np.allclose(data[field][k], expected, atol=tolerance, rtol=0):
             failures.setdefault(field, {'code': 'reference:' + field, 'tick': k,
                                        'time': float(data['t'][k])})
     gain = rebuild_gain_path(data['phase_k'], dt)
     if 'error' in gain:
-        return [{'code': 'reference:phase'}]
+        return [{'code': 'reference:phase'}], events
     velocity = np.zeros(6)
     block_time = dev_time = 0.
     blocked = False
@@ -236,6 +237,7 @@ def check_reference_path(data, config, dt):
             deficit_confirmed = (block_time >= block_spec['deficit_confirm_s'] - 1e-15
                                  and block_deficit >= block_spec['deficit_m'] - 1e-15)
             if block_time >= block_spec['confirm_s'] - 1e-15 or deficit_confirmed:
+                events.setdefault('blocked_confirm', float(data['t'][k]))
                 candidate[:3] -= normal * max(float(candidate[:3] @ normal), 0.)
                 block_correction = -normal * max(float((p - actual_p) @ normal) - block_spec['error_m'], 0.)
                 p += block_correction
@@ -289,7 +291,7 @@ def check_reference_path(data, config, dt):
         equal('blocked_now', k, blocked_now)
         equal('block_progress', k, np.r_[average, span, block_time, block_deficit])
         equal('block_correction_pos', k, block_correction)
-    return list(failures.values())
+    return list(failures.values()), events
 
 
 def expected_stimulus(case, times):

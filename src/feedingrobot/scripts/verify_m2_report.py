@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from feedingrobot.validation.m2.legacy import verify_finished_report
+from feedingrobot.validation.m2.spec import SCHEMA
 from feedingrobot.sim.model import repo_root
 
 
@@ -15,13 +16,17 @@ def assess_m2(run: Path, scope: str, check_workspace: bool) -> dict:
         header = json.loads((run / "run.json").read_text())
     except (OSError, ValueError):
         header = {}
-    if header.get("schema_version") in {"m2-full-v1", "m2-full-v2", "m2-full-v3"}:
+    if header.get("schema_version") == SCHEMA:
         from feedingrobot.validation.m2.package import evaluate
         verdict = evaluate(run, check_workspace=check_workspace, calibration=header.get("stage") == "calibration")
         if scope != ("calibration" if header.get("stage") == "calibration" else "full"):
-            verdict["scope_passed"] = verdict["m3_ready"] = False
+            verdict["scope_passed"] = verdict["m3_ready"] = verdict["evidence_valid"] = verdict["fixes_passed"] = False
             verdict["reasons"].append({"code":"full_scope_required"})
         return verdict
+    if header.get('schema_version') not in {None, 'm2-fix-v6'}:
+        return {'fixes_passed': False, 'evidence_valid': False, 'scope_passed': False,
+                'm3_ready': False, 'hybrid_force_status': 'disabled',
+                'reasons': [{'code': 'unsupported_schema', 'schema': header.get('schema_version')}]}
     return verify_finished_report(run, scope, check_workspace)
 
 

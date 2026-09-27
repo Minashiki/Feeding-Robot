@@ -311,6 +311,9 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
             check(np.linalg.norm(error[:3])<=.02 and np.linalg.norm(error[3:])<=.002, "unloaded_bias")
     elif case.family in {"spring","press"}:
         hold = (t >= 5.25) & (t <= 6.25)
+        if not np.any(hold):
+            check(False, 'steady_force_window')
+            return describe(failures), {}
         check(len(contact_ticks)>0 and max(contact_ticks)*dt > 5.25, "contact_missing")
         normal = np.asarray(meta["normal"])
         contact_force = np.zeros(n)
@@ -336,8 +339,6 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
         check(not np.any(d["reference_correction_pos"]), "stiffness_clipped")
     elif case.family == "wall":
         check(len(contact_ticks)>0 and np.any(d["blocked"]), "wall_blocked")
-        confirmed = np.linalg.norm(d['block_correction_pos'], axis=1) > 1e-12
-        check(np.any(confirmed & d['blocked_now'].astype(bool)), 'wall_progress_blocked')
         check(np.max(d["fixture"][:,3]) >= .035, "wall_not_retracted")
         release = round(3./dt)
         span = slice(release,release+round(.5/dt)+1)
@@ -374,15 +375,22 @@ def score(case: Case, seed, variant, data, meta, stop_damping=None, base_config=
             failures.extend(check_physics(d,case))
             failures.extend(check_sensor_chain(d,case,seed,dt))
             failures.extend(check_tool_dynamics(d))
-            failures.extend(check_reference_path(d,meta['effective_controller'],dt))
+            reference_failures, reference_events = check_reference_path(d,meta['effective_controller'],dt)
+            failures.extend(reference_failures)
+            events.update(reference_events)
         except (ValueError,KeyError,IndexError,TypeError,np.linalg.LinAlgError) as error:
             check(False,"physical_evidence",str(error))
+    if case.family == 'wall':
+        confirmed_at = events.get('blocked_confirm')
+        check(confirmed_at is not None and bool(d['blocked_now'][round(confirmed_at/dt)]),
+              'wall_progress_blocked')
+    steady = hold if case.family in {'spring', 'press'} else tail
     metrics = {"position_rms": rms(pe[tail]) if np.any(tail) else rms(pe), "rotation_rms": rms(re[tail]) if np.any(tail) else rms(re),
-               "force_peak": float(np.max(finite_force)), "force_mean": float(np.mean(finite_force[tail])) if np.any(tail) else 0.,
+               "force_peak": float(np.max(finite_force)), "force_mean": float(np.mean(force[steady])) if np.any(steady) else 0.,
                "moment_peak": float(np.nanmax(moment)), "tau_peak": np.max(np.abs(d["tau_cmd"]),axis=0).tolist(),
                "impulse": float(np.sum(finite_force)*dt), "events": events,
                "initial_qpos": d["initial_qpos"].tolist(), "initial_qvel": d["initial_qvel"].tolist()}
-    metrics.update(initial_source_identity=str(d['initial_source_identity'].item()),
+    metrics.update(family=case.family, initial_source_identity=str(d['initial_source_identity'].item()),
                    execution_id=str(d['execution_id'].item()), variant=variant)
     metrics["tracking_position_rms"]=rms(pe[moving]) if np.any(moving) else rms(pe)
     from feedingrobot.validation.m2.contact_checks import tool_contact_wrench
